@@ -1,0 +1,136 @@
+# ==============================================================================
+# Generic CAM & Toolpath Generation .gitignore
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Byte-compiled / Optimized / Binary Files
+# ------------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+*.dll
+*.dylib
+
+# ------------------------------------------------------------------------------
+# Virtual Environments & Packages
+# ------------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ------------------------------------------------------------------------------
+# Testing, Coverage & Linters
+# ------------------------------------------------------------------------------
+.pytest_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+cover/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# ------------------------------------------------------------------------------
+# Jupyter Notebook
+# ------------------------------------------------------------------------------
+.ipynb_checkpoints
+
+# ------------------------------------------------------------------------------
+# Node / Web Frontend (if used)
+# ------------------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ------------------------------------------------------------------------------
+# CAD/CAM Artifacts, Temporary Uploads & Scratch
+# ------------------------------------------------------------------------------
+scratch/
+temp/
+tmp/
+uploads/
+exports/
+debug_output/
+*.occ_cache/
+*.brep.tmp
+*.step.tmp
+*.iges.tmp
+*.stl.tmp
+*.tmp
+*.bak
+
+# Ensure demo/fixture sample models and reference NC files remain tracked
+!sample_bracket.step
+!sample_bracket_fanuc.nc
+!sample_bracket_grbl.nc
+
+# ------------------------------------------------------------------------------
+# Logs
+# ------------------------------------------------------------------------------
+*.log
+*.log.*
+
+# ------------------------------------------------------------------------------
+# IDEs, Editors & Assistant Workspaces
+# ------------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+.agents/
+.gemini/
+
+# ------------------------------------------------------------------------------
+# Operating System Files
+# ------------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini

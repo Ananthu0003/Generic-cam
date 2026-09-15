@@ -30,6 +30,7 @@ class FeatureType(str, Enum):
     BLIND_BORE = "blind_bore"
     COUNTERBORE = "counterbore"
     COUNTERSINK = "countersink"
+    TAPPED_HOLE = "tapped_hole"
     POCKET = "pocket"
     OPEN_POCKET = "open_pocket"
     SLOT = "slot"
@@ -43,6 +44,8 @@ class FeatureType(str, Enum):
     FREEFORM_SURFACE = "freeform_surface"
     CHAMFER = "chamfer"
     FILLET = "fillet"
+    THREADED_HOLE = "threaded_hole"
+    GROOVE = "groove"
 
 
 class Accessibility(str, Enum):
@@ -101,6 +104,7 @@ class FeatureRecognizer:
         requirements: Optional[dict[int, FinishRequirement]] = None,
         vertical_tol_deg: float = 12.0,
         horizontal_tol_deg: float = 12.0,
+        drill_diameters: Optional[list[float]] = None,
     ):
         self.shape = shape
         self.faces = shape.faces()
@@ -115,6 +119,7 @@ class FeatureRecognizer:
         self.requirements = requirements or {}
         self._vertical_tol_deg = vertical_tol_deg
         self._horizontal_tol_deg = horizontal_tol_deg
+        self._drill_diameters: Optional[list[float]] = sorted(drill_diameters) if drill_diameters else None
         self._model_top_z = self._compute_model_top_z()
         self._tags = self._tag_faces()
 
@@ -161,12 +166,33 @@ class FeatureRecognizer:
         """Execute full feature recognition pipeline and build relational hierarchy."""
         features: list[MachiningFeature] = []
         features += self._recognize_cylindrical_features()
+        features += self._recognize_countersinks(features)  # must follow cylindrical
         features += self._recognize_pockets_and_slots()
         features += self._recognize_facing_regions()
         features += self._recognize_chamfers()
         features += self._recognize_fillets()
         features += self._recognize_freeform()
+        features += self._recognize_threaded_holes(features)
+        features += self._recognize_grooves(features)
+        features += self._recognize_outer_contours()
         return self._dedupe_and_sort(features)
+
+    def _classify_hole_or_bore(self, diameter: float, is_through: bool) -> FeatureType:
+        """Classify an internal cylinder as a hole (drillable) or bore (requires endmill /
+        boring bar). When a drill_diameters list is provided, match against it;
+        otherwise fall back to a 12mm diameter threshold (traditional shop practice)."""
+        if self._drill_diameters is not None:
+            can_drill = any(abs(d - diameter) < 0.15 for d in self._drill_diameters)
+            if can_drill:
+                return FeatureType.THROUGH_HOLE if is_through else FeatureType.BLIND_HOLE
+            else:
+                return FeatureType.THROUGH_BORE if is_through else FeatureType.BLIND_BORE
+        # Fallback: diameter threshold (12mm is the traditional max twist-drill size in
+        # most general-purpose shops; can be overridden by passing drill_diameters)
+        bore_threshold = 12.0
+        if diameter > bore_threshold:
+            return FeatureType.THROUGH_BORE if is_through else FeatureType.BLIND_BORE
+        return FeatureType.THROUGH_HOLE if is_through else FeatureType.BLIND_HOLE
 
     # -------------------------------------------------------------------------
     # Cylindrical features: Holes, Bores, Counterbores, Countersinks, Bosses
@@ -270,8 +296,9 @@ class FeatureRecognizer:
                 bmax = np.array([c["center_xy"][0] + c["radius"], c["center_xy"][1] + c["radius"], c["top_z"]])
 
                 # Check through vs blind: does it reach model bottom?
-                is_through = abs(c["bottom_z"]) < 0.5 or (c["bottom_z"] <= min(f.bounds_min[2] for f in self.faces) + 0.5)
-                ftype = (FeatureType.THROUGH_BORE if c["diameter"] > 25.0 else FeatureType.THROUGH_HOLE) if is_through else (FeatureType.BLIND_HOLE)
+                model_bottom_z = min(float(f.bounds_min[2]) for f in self.faces if len(f.triangles))
+                is_through = c["bottom_z"] <= model_bottom_z + 0.5
+                ftype = self._classify_hole_or_bore(c["diameter"], is_through)
 
                 out.append(MachiningFeature(
                     id=f"hole_{c['group'][0]}",
@@ -330,9 +357,12 @@ class FeatureRecognizer:
                 bmin_ch = np.array([child_bottom["center_xy"][0] - child_bottom["radius"], child_bottom["center_xy"][1] - child_bottom["radius"], child_bottom["bottom_z"]])
                 bmax_ch = np.array([child_bottom["center_xy"][0] + child_bottom["radius"], child_bottom["center_xy"][1] + child_bottom["radius"], child_bottom["top_z"]])
 
+                model_bottom_z = min(float(f.bounds_min[2]) for f in self.faces if len(f.triangles))
+                is_child_through = child_bottom["bottom_z"] <= model_bottom_z + 0.5
+                child_ftype = self._classify_hole_or_bore(child_bottom["diameter"], is_child_through)
                 child_feat = MachiningFeature(
                     id=child_id,
-                    type=FeatureType.THROUGH_HOLE if child_bottom["diameter"] <= 25.0 else FeatureType.BORE,
+                    type=child_ftype,
                     face_indices=child_bottom["group"],
                     bounds_min=bmin_ch,
                     bounds_max=bmax_ch,
@@ -345,11 +375,91 @@ class FeatureRecognizer:
                     accessibility=self._accessibility_of(child_bottom["group"]),
                     wall_faces=child_bottom["group"],
                     parent_feature_id=cbore_id,
-                    recognition_evidence=["coaxial_child_bore", f"diameter_{child_bottom['diameter']:.2f}"],
+                    recognition_evidence=[
+                        "coaxial_child_bore",
+                        f"diameter_{child_bottom['diameter']:.2f}",
+                        "through_opening" if is_child_through else "blind_bottom",
+                    ],
                 )
 
                 out.extend([cbore_feat, child_feat])
 
+        return out
+
+    # -------------------------------------------------------------------------
+    # Countersink recognition (CONE faces coaxial with holes)
+    # -------------------------------------------------------------------------
+    def _recognize_countersinks(self, existing: list[MachiningFeature]) -> list[MachiningFeature]:
+        """Find CONE faces that form countersinks above existing hole features.
+        A countersink is a conical chamfer at a hole entry:
+        - SurfaceKind.CONE with semi_angle in [10°, 70°] (covers 82°, 90°, 118°, 120° tools)
+        - Cone axis parallel to the tool axis (within 15°)
+        - Cone centre XY coincides with an existing hole feature (within 1.5 mm)"""
+        out: list[MachiningFeature] = []
+        for cf in self.faces:
+            if cf.surface.kind is not SurfaceKind.CONE:
+                continue
+            sd = cf.surface
+            if sd.axis is None or sd.semi_angle is None or sd.point_on is None:
+                continue
+            cone_axis = sd.axis / max(float(np.linalg.norm(sd.axis)), 1e-12)
+            # Cone axis must be coaxial with tool axis (up to 15° deviation)
+            if abs(abs(float(cone_axis @ self.tool_axis)) - 1.0) > 0.26:  # cos(15°)≈0.97 tolerance
+                continue
+            semi_deg = float(np.degrees(abs(sd.semi_angle)))
+            if not (10.0 < semi_deg < 70.0):
+                continue
+            if not len(cf.triangles):
+                continue
+            zs = cf.triangles[:, :, 2].ravel()
+            top_z = float(zs.max())
+            bottom_z = float(zs.min())
+            depth = top_z - bottom_z
+            if depth < 0.05:
+                continue
+            ref_r = float(abs(sd.ref_radius)) if sd.ref_radius is not None else 0.0
+            major_r = ref_r + depth * float(np.tan(float(abs(sd.semi_angle))))
+            major_dia = 2.0 * major_r
+            if major_dia < 0.5:
+                continue
+            centre_xy = sd.point_on[:2].copy()
+            # Find parent hole (nearest coaxial internal cylindrical feature)
+            parent_id: Optional[str] = None
+            hole_types = (FeatureType.HOLE, FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE,
+                          FeatureType.BORE, FeatureType.THROUGH_BORE, FeatureType.BLIND_BORE,
+                          FeatureType.COUNTERBORE)
+            for ef in existing:
+                if ef.type not in hole_types:
+                    continue
+                if float(np.linalg.norm(ef.center_xy - centre_xy)) < 1.5:
+                    parent_id = ef.id
+                    break
+            csink_id = f"csink_{cf.index}"
+            out.append(MachiningFeature(
+                id=csink_id,
+                type=FeatureType.COUNTERSINK,
+                face_indices=[cf.index],
+                bounds_min=np.array([centre_xy[0] - major_r, centre_xy[1] - major_r, bottom_z]),
+                bounds_max=np.array([centre_xy[0] + major_r, centre_xy[1] + major_r, top_z]),
+                depth=depth,
+                top_z=top_z,
+                floor_z=bottom_z,
+                axis=cone_axis.copy(),
+                diameter=major_dia,
+                is_concave=True,
+                accessibility=Accessibility.TOOL_AXIS_OK,
+                parent_feature_id=parent_id,
+                recognition_evidence=[
+                    f"cone_semi_angle_{semi_deg:.1f}deg",
+                    f"included_angle_{2 * semi_deg:.1f}deg",
+                    f"major_diameter_{major_dia:.2f}mm",
+                ],
+                notes={
+                    "semi_angle_deg": semi_deg,
+                    "included_angle_deg": 2.0 * semi_deg,
+                    "countersink_angle_deg": 90.0 - semi_deg,
+                },
+            ))
         return out
 
     def _group_cylinder_faces(self) -> list[list[int]]:
@@ -441,18 +551,25 @@ class FeatureRecognizer:
                 continue
 
             all_feature_faces = floor_group + wall_faces_list
-            all_pts = np.concatenate([self.faces[i].triangles[:, :, :2].reshape(-1, 2) for i in all_feature_faces if len(self.faces[i].triangles)])
-            bmin2 = all_pts.min(axis=0)
-            bmax2 = all_pts.max(axis=0)
+            floor_pts = np.concatenate([self.faces[i].triangles[:, :, :2].reshape(-1, 2) for i in floor_group if len(self.faces[i].triangles)])
+            bmin2 = floor_pts.min(axis=0)
+            bmax2 = floor_pts.max(axis=0)
             extent = bmax2 - bmin2
 
             # Extract 2D boundary loop from floor wire loops if available
             boundary_loop: Optional[list[np.ndarray]] = None
+            island_loops: list[list[np.ndarray]] = []
             for fg in floor_group:
                 for w in self.faces[fg].wires:
-                    if w.is_outer and len(w.points) >= 3:
-                        boundary_loop = [p[:2].copy() for p in w.points]
-                        break
+                    if len(w.points) < 3:
+                        continue
+                    loop_2d = [p[:2].copy() for p in w.points]
+                    if w.is_outer:
+                        if boundary_loop is None:
+                            boundary_loop = loop_2d
+                    else:
+                        # Inner wire = island (boss/obstacle inside the pocket)
+                        island_loops.append(loop_2d)
 
             # Check open vs closed boundary
             # If wall faces don't fully close around the floor, or floor touches stock outer bounds -> STEP / OPEN_SLOT
@@ -486,12 +603,14 @@ class FeatureRecognizer:
                 wall_faces=wall_faces_list,
                 floor_faces=floor_group,
                 boundary_loop=boundary_loop,
+                island_loops=island_loops if island_loops else None,
                 finish=self.requirements.get(floor_group[0]),
                 recognition_evidence=[
                     f"type_{ftype.value}",
                     f"depth_{depth:.2f}",
                     f"floor_area_{sum(self.faces[i].area for i in floor_group):.1f}",
                     "open_boundary" if is_open else "closed_cavity",
+                    f"islands_{len(island_loops)}" if island_loops else "no_islands",
                 ],
             ))
         return out
@@ -561,6 +680,7 @@ class FeatureRecognizer:
                         floor_z=bottom_z,
                         is_concave=False,
                         accessibility=Accessibility.TOOL_AXIS_OK,
+                        notes={"angle_from_horizontal": angle_from_horiz},
                         recognition_evidence=[f"chamfer_angle_{angle_from_horiz:.1f}deg"],
                     ))
         return out
@@ -610,6 +730,132 @@ class FeatureRecognizer:
                 ))
         return out
 
+    def _recognize_threaded_holes(self, existing: list[MachiningFeature]) -> list[MachiningFeature]:
+        """Upgrade existing HOLE/THROUGH_HOLE features to THREADED_HOLE if they have
+        thread annotations in notes. Thread detection from pure geometry is unreliable,
+        so this relies on user-provided annotations or notes from upstream planners."""
+        out: list[MachiningFeature] = []
+        for f in existing:
+            if f.type in (FeatureType.HOLE, FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE):
+                if f.notes.get("tapped") or f.notes.get("threaded"):
+                    out.append(MachiningFeature(
+                        id=f.id,
+                        type=FeatureType.THREADED_HOLE,
+                        face_indices=f.face_indices,
+                        bounds_min=f.bounds_min.copy(),
+                        bounds_max=f.bounds_max.copy(),
+                        depth=f.depth,
+                        top_z=f.top_z,
+                        floor_z=f.floor_z,
+                        axis=f.axis.copy() if f.axis is not None else None,
+                        diameter=f.diameter,
+                        is_concave=True,
+                        accessibility=f.accessibility,
+                        wall_faces=f.wall_faces,
+                        floor_faces=f.floor_faces,
+                        parent_feature_id=f.parent_feature_id,
+                        child_feature_ids=f.child_feature_ids,
+                        recognition_evidence=f.recognition_evidence + ["threaded_hole_upgrade"],
+                        notes=f.notes,
+                        boundary_loop=f.boundary_loop,
+                        island_loops=f.island_loops,
+                    ))
+        return out
+
+    def _recognize_grooves(self, existing: list[MachiningFeature]) -> list[MachiningFeature]:
+        """Recognize groove features: narrow slots or annular channels that require
+        a groove cutter. Detects features with groove annotations or narrow slot geometry."""
+        out: list[MachiningFeature] = []
+        for f in existing:
+            if f.type == FeatureType.SLOT and f.diameter is not None:
+                # Narrow slot that might be a groove
+                if f.notes.get("groove") or (f.depth > 0 and f.xy_extent.min() < 5.0):
+                    out.append(MachiningFeature(
+                        id=f.id,
+                        type=FeatureType.GROOVE,
+                        face_indices=f.face_indices,
+                        bounds_min=f.bounds_min.copy(),
+                        bounds_max=f.bounds_max.copy(),
+                        depth=f.depth,
+                        top_z=f.top_z,
+                        floor_z=f.floor_z,
+                        diameter=f.diameter,
+                        is_concave=True,
+                        accessibility=f.accessibility,
+                        wall_faces=f.wall_faces,
+                        floor_faces=f.floor_faces,
+                        recognition_evidence=f.recognition_evidence + ["groove_from_slot"],
+                        notes=f.notes,
+                        boundary_loop=f.boundary_loop,
+                        island_loops=f.island_loops,
+                    ))
+        return out
+
+    def _recognize_outer_contours(self) -> list[MachiningFeature]:
+        """Recognize the outer perimeter / external boundary contour of the part.
+        This feature drives outer profile clearing (stock removal) and perimeter finishing."""
+        out: list[MachiningFeature] = []
+        if not self.faces:
+            return out
+
+        model_bottom_z = min(float(f.bounds_min[2]) for f in self.faces if len(f.triangles))
+        depth = self._model_top_z - model_bottom_z
+        if depth <= 1e-4:
+            return out
+
+        all_pts_list = [f.triangles.reshape(-1, 3) for f in self.faces if len(f.triangles)]
+        if not all_pts_list:
+            return out
+        all_pts = np.concatenate(all_pts_list)
+        bmin = all_pts.min(axis=0)
+        bmax = all_pts.max(axis=0)
+        extent = bmax[:2] - bmin[:2]
+        if extent[0] <= 1e-4 or extent[1] <= 1e-4:
+            return out
+
+        wall_faces = [f.index for f in self.faces if self._tags.get(f.index) in ("wall", "slanted", "cylinder")]
+
+        boundary_loop: Optional[list[np.ndarray]] = None
+        for f in self.faces:
+            if self._tags.get(f.index) in ("top", "bottom"):
+                for w in f.wires:
+                    if w.is_outer and len(w.points) >= 3:
+                        boundary_loop = [p[:2].copy() for p in w.points]
+                        break
+            if boundary_loop is not None:
+                break
+
+        if boundary_loop is None:
+            boundary_loop = [
+                np.array([bmin[0], bmin[1]]),
+                np.array([bmax[0], bmin[1]]),
+                np.array([bmax[0], bmax[1]]),
+                np.array([bmin[0], bmax[1]]),
+            ]
+
+        out.append(MachiningFeature(
+            id="contour_outer",
+            type=FeatureType.CONTOUR,
+            face_indices=wall_faces if wall_faces else [f.index for f in self.faces],
+            bounds_min=np.array([bmin[0], bmin[1], model_bottom_z]),
+            bounds_max=np.array([bmax[0], bmax[1], self._model_top_z]),
+            depth=depth,
+            top_z=self._model_top_z,
+            floor_z=model_bottom_z,
+            is_concave=False,
+            accessibility=Accessibility.TOOL_AXIS_OK,
+            wall_faces=wall_faces,
+            boundary_loop=boundary_loop,
+            notes={"perimeter": True, "outer_contour": True},
+            recognition_evidence=[
+                "outer_part_boundary_profile",
+                f"depth_{depth:.2f}",
+                f"bounds_min_{bmin[0]:.1f}_{bmin[1]:.1f}",
+                f"bounds_max_{bmax[0]:.1f}_{bmax[1]:.1f}",
+            ],
+        ))
+        return out
+
     def _accessibility_of(self, face_ids: list[int]) -> Accessibility:
         mesh = TriangleMesh.from_faces(self.faces)
         if not len(mesh.triangles):
@@ -623,6 +869,14 @@ class FeatureRecognizer:
                 hit = mesh.ray_first_hit(p + self.tool_axis * 1e-3, self.tool_axis, max_dist=1e4)
                 if hit is not None and hit < 1e-1:
                     return Accessibility.INACCESSIBLE
+            # Check if face normal requires tilted tool axis
+            face_normal = f.oriented_normal
+            if face_normal is not None:
+                cos_angle = abs(np.dot(face_normal, self.tool_axis))
+                # If face normal is more than vertical_tol_deg from tool axis,
+                # it needs a tilted tool (but is still accessible)
+                if cos_angle < np.cos(np.radians(self._vertical_tol_deg)):
+                    worst = Accessibility.NEEDS_TILTED_TOOL
         return worst
 
     def _dedupe_and_sort(self, features: list[MachiningFeature]) -> list[MachiningFeature]:

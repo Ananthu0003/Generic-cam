@@ -131,3 +131,24 @@ class VoxelStock:
             update = np.isnan(out) & layer
             out[update] = self.origin[2] + k * self.voxel_size
         return out
+
+    def excess_material_volume(self, target_mesh) -> float:
+        """Compare remaining stock against target model mesh.
+        Returns volume of material that should have been removed but wasn't
+        (excess stock above the finished model surface)."""
+        if not hasattr(target_mesh, 'triangles') or not len(target_mesh.triangles):
+            return 0.0
+        # Get all occupied voxel centers as a batch
+        occupied = np.argwhere(self.voxels)
+        if len(occupied) == 0:
+            return 0.0
+        # Convert indices to world coordinates
+        centers = self.origin + occupied * self.voxel_size
+        excess_count = 0
+        for c in centers:
+            hs = target_mesh.heights_above(c[0], c[1])
+            if hs:
+                model_top = max(hs)
+                if c[2] > model_top + 1e-6:
+                    excess_count += 1
+        return excess_count * self.voxel_size ** 3

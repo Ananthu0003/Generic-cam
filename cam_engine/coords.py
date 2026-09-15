@@ -99,6 +99,7 @@ class CoordinateSystemChain:
             "setup": m2s,
             "work": s2w @ m2s,
             "machine": w2m @ s2w @ m2s,
+            "tool": s2w @ m2s,  # tool space ≈ work space for 3-axis (tool tip at origin)
         }
         if src == dst:
             return identity()

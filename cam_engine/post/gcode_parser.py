@@ -84,3 +84,46 @@ class GCodeValidator:
             )
 
         return blocks
+
+    def verify(self, gcode: str, stock_bounds_min=None, stock_bounds_max=None,
+               machine_limits=None) -> list[dict]:
+        """Verify parsed G-code against constraints.
+        Returns list of issues found (empty = clean)."""
+        blocks = self.parse(gcode)
+        issues = []
+        prev_pos = None
+        for b in blocks:
+            if b.target_pos is None:
+                continue
+            pos = b.target_pos
+            # Check continuity (no teleporting during cutting)
+            if prev_pos is not None and b.is_cutting:
+                dist = float(np.linalg.norm(pos - prev_pos))
+                if dist > 100.0:  # >100mm cutting move is suspicious
+                    issues.append({
+                        "line": b.line_number, "type": "large_cut",
+                        "message": f"Large cutting move {dist:.1f}mm at line {b.line_number}"
+                    })
+            # Check stock bounds
+            if stock_bounds_min is not None and stock_bounds_max is not None:
+                if b.is_cutting:
+                    if (pos[0] < stock_bounds_min[0] - 0.1 or
+                            pos[0] > stock_bounds_max[0] + 0.1 or
+                            pos[1] < stock_bounds_min[1] - 0.1 or
+                            pos[1] > stock_bounds_max[1] + 0.1):
+                        issues.append({
+                            "line": b.line_number, "type": "out_of_stock",
+                            "message": f"Cut at ({pos[0]:.1f},{pos[1]:.1f}) outside stock bounds"
+                        })
+            # Check machine limits
+            if machine_limits is not None:
+                for ax_idx, ax_name in enumerate(["X", "Y", "Z"]):
+                    if ax_name in machine_limits:
+                        lo, hi = machine_limits[ax_name]
+                        if pos[ax_idx] < lo - 0.1 or pos[ax_idx] > hi + 0.1:
+                            issues.append({
+                                "line": b.line_number, "type": "axis_limit",
+                                "message": f"{ax_name}={pos[ax_idx]:.1f} outside [{lo},{hi}]"
+                            })
+            prev_pos = pos.copy()
+        return issues

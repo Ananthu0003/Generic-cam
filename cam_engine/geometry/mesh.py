@@ -7,6 +7,7 @@ Operates on real tessellated B-Rep geometry only.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 
@@ -16,6 +17,8 @@ class TriangleMesh:
     """Flat triangle soup with an acceleration grid over triangle AABBs."""
 
     triangles: np.ndarray  # (N, 3, 3)
+    _cached_grid: Optional[tuple] = None
+    _cached_cell: float = 0.0
 
     @classmethod
     def from_faces(cls, faces) -> "TriangleMesh":
@@ -33,6 +36,9 @@ class TriangleMesh:
     def _grid(self, cell: float = 5.0):
         if not len(self.triangles):
             return None
+        # Return cached grid if cell size hasn't changed and triangles haven't been modified
+        if self._cached_grid is not None and self._cached_cell == cell:
+            return self._cached_grid
         bmin, bmax = self.bounds()
         dims = np.maximum(np.ceil((bmax - bmin) / cell).astype(int) + 1, 1)
         grid: dict[tuple[int, int, int], list[int]] = {}
@@ -40,7 +46,10 @@ class TriangleMesh:
         cells = np.clip(((centers - bmin) / cell).astype(int), 0, dims - 1)
         for i, c in enumerate(cells):
             grid.setdefault((int(c[0]), int(c[1]), int(c[2])), []).append(i)
-        return bmin, bmax, cell, grid, dims
+        result = (bmin, bmax, cell, grid, dims)
+        self._cached_grid = result
+        self._cached_cell = cell
+        return result
 
     def ray_first_hit(self, origin: np.ndarray, direction: np.ndarray,
                       max_dist: float = 1e6) -> float | None:
@@ -136,11 +145,34 @@ class TriangleMesh:
         return max(hits) if hits else None
 
     def heights_above(self, x: float, y: float) -> list[float]:
-        """All triangle surface Z values at (x,y) (intersection of vertical line)."""
+        """All triangle surface Z values at (x,y) (intersection of vertical line).
+        Uses grid acceleration to only test triangles in the relevant cell."""
         out: list[float] = []
         if not len(self.triangles):
             return out
-        tri = self.triangles
+        g = self._grid()
+        if g is None:
+            return out
+        bmin, bmax, cell, grid, dims = g
+        # Find the cell for this (x, y) point
+        cx = int(np.clip((x - bmin[0]) / cell, 0, dims[0] - 1))
+        cy = int(np.clip((y - bmin[1]) / cell, 0, dims[1] - 1))
+        # Check triangles in this cell and neighbors for accuracy
+        tri_indices = []
+        for dx in range(-1, 2):
+            for dy in range(-1, 2):
+                nx, ny = cx + dx, cy + dy
+                if 0 <= nx < dims[0] and 0 <= ny < dims[1]:
+                    key = (nx, ny)
+                    # Need to iterate over all z-layers in this column
+                    for cz in range(dims[2]):
+                        full_key = (nx, ny, cz)
+                        if full_key in grid:
+                            tri_indices.extend(grid[full_key])
+        if not tri_indices:
+            return out
+        # Test only the relevant triangles
+        tri = self.triangles[tri_indices]
         v0, v1, v2 = tri[:, 0], tri[:, 1], tri[:, 2]
         # 2D point-in-triangle in XY, then interpolate Z
         px, py = x, y

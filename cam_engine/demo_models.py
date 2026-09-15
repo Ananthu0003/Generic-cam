@@ -24,6 +24,35 @@ class DemoCADModel:
     faces_metadata: list[dict] # per-face metadata (type, center, normal)
 
 
+def create_prismatic_bracket_shape():
+    """Creates a true B-Rep solid CAD model of the sample CNC milling test part:
+    - Base: 100 x 60 x 25 mm
+    - Top Facing face at Z = 25 mm
+    - Rectangular Pocket: 40 x 30 mm, depth 10 mm (floor at Z = 15)
+    - Through Hole: 12 mm diameter at (70, 30), depth 25 mm (Z = 0)
+    - Step feature on the right side: 20 mm wide, 8 mm stepdown (Z = 17)
+    """
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.gp import gp_Ax2, gp_Pnt, gp_Dir
+    from .geometry.topology import Shape
+    from .geometry.step_import import ImportedModel
+
+    base = BRepPrimAPI_MakeBox(100.0, 60.0, 25.0).Shape()
+    step_cut = BRepPrimAPI_MakeBox(gp_Pnt(80.0, -1.0, 17.0), gp_Pnt(101.0, 61.0, 26.0)).Shape()
+    s1 = BRepAlgoAPI_Cut(base, step_cut).Shape()
+    pocket_cut = BRepPrimAPI_MakeBox(gp_Pnt(15.0, 15.0, 15.0), gp_Pnt(55.0, 45.0, 26.0)).Shape()
+    s2 = BRepAlgoAPI_Cut(s1, pocket_cut).Shape()
+    hole_cut = BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(70.0, 30.0, -1.0), gp_Dir(0.0, 0.0, 1.0)), 6.0, 27.0).Shape()
+    s3 = BRepAlgoAPI_Cut(s2, hole_cut).Shape()
+    shape = Shape(s3)
+    return ImportedModel(
+        shape=shape,
+        declared_units="mm",
+        original_bounds=shape.bounding_box(),
+    )
+
+
 def create_prismatic_bracket_mesh() -> DemoCADModel:
     """Creates a sample CNC milling test part:
     - Base: 100 x 60 x 25 mm
@@ -296,6 +325,81 @@ def get_default_tools() -> list[Tool]:
             flutes=2,
             material="carbide",
             can_plunge=False,
+        ),
+        Tool(
+            id="T13",
+            tool_number=13,
+            type=ToolType.TAP,
+            diameter=6.0,
+            corner_radius=0.0,
+            flute_length=25.0,
+            overall_length=65.0,
+            flutes=2,
+            material="hss",
+            can_plunge=True,
+        ),
+        Tool(
+            id="T14",
+            tool_number=14,
+            type=ToolType.REAMER,
+            diameter=8.0,
+            corner_radius=0.0,
+            flute_length=30.0,
+            overall_length=70.0,
+            flutes=6,
+            material="carbide",
+            can_plunge=False,
+        ),
+        Tool(
+            id="T15",
+            tool_number=15,
+            type=ToolType.THREAD_MILL,
+            diameter=4.0,
+            corner_radius=0.0,
+            flute_length=15.0,
+            overall_length=55.0,
+            flutes=4,
+            material="carbide",
+            can_plunge=False,
+        ),
+        Tool(
+            id="T16",
+            tool_number=16,
+            type=ToolType.GROOVE_CUTTER,
+            diameter=3.0,
+            corner_radius=0.0,
+            flute_length=10.0,
+            overall_length=50.0,
+            flutes=2,
+            material="carbide",
+            can_plunge=True,
+        ),
+        # T17: 90° countersink — covers M3-M10 clearance holes
+        Tool(
+            id="T17",
+            tool_number=17,
+            type=ToolType.COUNTERSINK_TOOL,
+            diameter=12.0,       # major diameter of conical tool
+            corner_radius=0.0,
+            flute_length=8.0,
+            overall_length=55.0,
+            flutes=6,
+            material="carbide",
+            can_plunge=True,
+            tip_radius=0.0,
+        ),
+        # T18: boring bar — 16mm minimum bore diameter
+        Tool(
+            id="T18",
+            tool_number=18,
+            type=ToolType.BORING_BAR,
+            diameter=16.0,       # adjustable; this is the nominal bore diameter
+            corner_radius=0.0,
+            flute_length=60.0,
+            overall_length=120.0,
+            flutes=1,            # single-point
+            material="carbide",
+            can_plunge=True,
         ),
     ]
 

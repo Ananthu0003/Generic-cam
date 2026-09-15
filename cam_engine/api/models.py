@@ -63,6 +63,25 @@ class ToolItem(BaseModel):
     max_feed: float = 3000.0
 
 
+class AddToolRequest(BaseModel):
+    tool_number: Optional[int] = None
+    name: Optional[str] = None
+    tool_type: str = "drill"          # drill, flat_endmill, ball_endmill, bullnose_endmill, chamfer_mill, countersink_tool, boring_bar, reamer, tap
+    diameter: float
+    corner_radius: float = 0.0
+    flute_length: float = 15.0
+    overall_length: float = 50.0
+    flutes: int = 2
+    material: str = "carbide"
+
+
+class AutoSuggestToolRequest(BaseModel):
+    feature_id: str
+    tool_type: Optional[str] = None
+    diameter: Optional[float] = None
+
+
+
 class MachineItem(BaseModel):
     id: str
     name: str
@@ -77,13 +96,75 @@ class StockConfig(BaseModel):
     margin_x: float = 5.0
     margin_y: float = 5.0
     margin_z_top: float = 1.0
-    margin_z_bottom: float = 2.0
+    margin_z_bottom: float = 3.0
+    offset_x: float = 0.0
+    offset_y: float = 0.0
+    offset_z: float = 0.0
     material: str = "aluminum_6061"
+    work_offset: str = "G54"
+    thread_pitch: float = 1.0
+    groove_width: float = 3.0
+    clamp_type: str = "vise_jaws"     # "vise_jaws", "toe_clamps", "fixture_plate", "none"
+    clamp_height: float = 3.0         # clamping hold allowance height from stock bottom in mm
+    clamp_width: float = 12.0         # clamp/vise jaw thickness in mm
+
+
+class OrientModelRequest(BaseModel):
+    axis: str = "X"              # "X", "Y", "Z"
+    angle_deg: float = 90.0
+    align_face_id: Optional[int] = None
+
+
+class SetupItem(BaseModel):
+    id: str
+    name: str
+    work_offset: str = "G54"
+    tool_axis: list[float] = Field(default_factory=lambda: [0.0, 0.0, 1.0])
+    rotation_deg: list[float] = Field(default_factory=lambda: [0.0, 0.0, 0.0])
+    stock: StockConfig = Field(default_factory=StockConfig)
+    feature_ids: list[str] = Field(default_factory=list)
+    operations_count: int = 0
+    is_active: bool = False
+
+
+class AddSetupRequest(BaseModel):
+    name: str
+    work_offset: str = "G55"
+    preset: Optional[str] = "flip_x_180"  # "top", "flip_x_180", "flip_y_180", "side_x_90", "side_y_90"
+    rotation_deg: Optional[list[float]] = None
+    stock: Optional[StockConfig] = None
+
+
+class SetupsListResponse(BaseModel):
+    setups: list[SetupItem]
+    active_setup_id: str
+
+
+class MultiSetupToolpathsResponse(BaseModel):
+    setups_toolpaths: dict[str, list[ToolpathItem]]
+    total_cutting_length_mm: float
+    total_rapid_length_mm: float
+    estimated_time_seconds: float
+
+
+class MultiSetupPostProcessResponse(BaseModel):
+    controller: str
+    gcode: str
+    line_count: int
+    cycle_time_seconds: float
+    rapid_time_seconds: float
+    cut_time_seconds: float
+    total_rapid_dist_mm: float
+    total_cut_dist_mm: float
+    tool_changes: list[str]
+    setups: list[str]
 
 
 class PlanOpsRequest(BaseModel):
     stock: StockConfig = Field(default_factory=StockConfig)
     selected_features: Optional[list[str]] = None
+    work_offset: str = "G54"
+    setup_id: Optional[str] = None
 
 
 class PlannedOpItem(BaseModel):
@@ -96,6 +177,7 @@ class PlannedOpItem(BaseModel):
     spindle_rpm: float
     stepover_mm: float
     stepdown_mm: float
+    setup_id: Optional[str] = None
     enabled: bool = True
     notes: dict[str, Any] = Field(default_factory=dict)
 
@@ -103,6 +185,10 @@ class PlannedOpItem(BaseModel):
 class PlanOpsResponse(BaseModel):
     operations: list[PlannedOpItem]
     stock_bounds: BoundingBox
+    setup_id: Optional[str] = None
+    warnings: list[dict[str, Any]] = Field(default_factory=list)
+    unmachined_features: list[dict[str, Any]] = Field(default_factory=list)
+
 
 
 class MotionSegmentItem(BaseModel):
@@ -121,6 +207,7 @@ class ToolpathItem(BaseModel):
     operation_id: str
     purpose: str
     tool_id: str
+    setup_id: Optional[str] = None
     segment_count: int
     cutting_length_mm: float
     rapid_length_mm: float
@@ -130,6 +217,9 @@ class ToolpathItem(BaseModel):
 class GenerateToolpathsRequest(BaseModel):
     operations: Optional[list[PlannedOpItem]] = None
     stock: StockConfig = Field(default_factory=StockConfig)
+    work_offset: str = "G54"
+    setup_id: Optional[str] = None
+    all_setups: bool = False
 
 
 class GenerateToolpathsResponse(BaseModel):
@@ -137,12 +227,14 @@ class GenerateToolpathsResponse(BaseModel):
     total_cutting_length_mm: float
     total_rapid_length_mm: float
     estimated_time_seconds: float
+    setup_id: Optional[str] = None
 
 
 class PostProcessRequest(BaseModel):
     controller: str = "grbl"
     work_offset: str = "G54"
     program_name: str = "PART_01"
+    all_setups: bool = True
 
 
 class PostProcessResponse(BaseModel):
@@ -156,3 +248,4 @@ class PostProcessResponse(BaseModel):
     total_cut_dist_mm: float
     tool_changes: list[str]
     work_offset: str
+    setups: Optional[list[str]] = None

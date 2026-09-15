@@ -203,7 +203,9 @@ def test_tapping_uses_feed_per_rev():
     tp = engine.generate(op)
 
     plunge = [s for s in tp.segments if s.motion_type is MotionType.PLUNGE][0]
-    assert plunge.feed == pytest.approx(1.5)
+    z_max_feed = engine.s.context.machine.axis_for("Z").max_feed
+    expected_feed_mm_min = min(1.5 * op.params.spindle_rpm, z_max_feed)
+    assert plunge.feed == pytest.approx(expected_feed_mm_min)
     assert plunge.metadata.get("tap_feed_mm_per_rev") == 1.5
     assert tp.metadata["canned_cycle_intent"]["cycle"] == "G84"
     assert tp.metadata["tap_feed_mm_per_rev"] == 1.5
@@ -285,3 +287,58 @@ def test_planner_purposes_now_generate_toolpaths():
         op = make_op(t, purpose, feat, notes=notes)
         tp = engine.generate(op)
         assert tp.purpose == purpose.value
+
+
+# ---------------------------------------------------- countersinking & boring ----
+
+def test_countersinking_strategy():
+    engine, _ = make_engine()
+    csink_tool = make_tool("T17", ToolType.COUNTERSINK_TOOL, diameter=12.0)
+    csink_tool.tip_angle = 90.0
+
+    f = make_feature(
+        id="csink_1",
+        type=FeatureType.COUNTERSINK,
+        depth=3.0,
+        diameter=10.0,
+        top_z=25.0,
+        floor_z=22.0,
+    )
+    op = make_op(csink_tool, OpPurpose.COUNTERSINKING, f)
+    tp = engine.generate(op)
+
+    assert tp.purpose == "countersinking"
+    assert tp.metadata["strategy"] == "countersinking"
+    assert tp.metadata["canned_cycle_intent"]["cycle"] == "G82"
+    assert tp.metadata["canned_cycle_intent"]["dwell_seconds"] == 0.2
+
+    plunges = [s for s in tp.segments if s.motion_type is MotionType.PLUNGE]
+    assert len(plunges) == 1
+    assert plunges[0].end[2] == pytest.approx(22.0)
+
+
+def test_boring_strategy_g86_and_g76():
+    engine, _ = make_engine()
+    boring_bar = make_tool("T18", ToolType.BORING_BAR, diameter=16.0)
+
+    f = make_feature(
+        id="bore_1",
+        type=FeatureType.THROUGH_BORE,
+        depth=20.0,
+        diameter=18.0,
+        top_z=25.0,
+        floor_z=5.0,
+    )
+
+    # Standard boring -> G86
+    op_std = make_op(boring_bar, OpPurpose.BORING, f)
+    tp_std = engine.generate(op_std)
+    assert tp_std.purpose == "boring"
+    assert tp_std.metadata["canned_cycle_intent"]["cycle"] == "G86"
+
+    # Fine boring -> G76
+    op_fine = make_op(boring_bar, OpPurpose.BORING, f, notes={"fine_boring": True, "shift_amount_mm": 0.5})
+    tp_fine = engine.generate(op_fine)
+    assert tp_fine.metadata["canned_cycle_intent"]["cycle"] == "G76"
+    assert tp_fine.metadata["canned_cycle_intent"]["shift"] == 0.5
+

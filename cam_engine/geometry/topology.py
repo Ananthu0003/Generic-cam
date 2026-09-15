@@ -125,6 +125,65 @@ class Shape:
         xf = BRepBuilderAPI_Transform(self.occ_shape, gp_trsf, True)
         return Shape(xf.Shape())
 
+    def rotate(self, axis_name: str, angle_deg: float) -> "Shape":
+        """Rotate the shape around X, Y, or Z axis by angle_deg degrees centered at bounding box center."""
+        bmin, bmax = self.bounding_box()
+        center = 0.5 * (bmin + bmax)
+        rad = np.radians(angle_deg)
+        c, s = np.cos(rad), np.sin(rad)
+        if axis_name.upper() == "X":
+            rot = np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=float)
+        elif axis_name.upper() == "Y":
+            rot = np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=float)
+        else:  # Z
+            rot = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=float)
+
+        t1 = np.eye(4)
+        t1[:3, 3] = -center
+        r4 = np.eye(4)
+        r4[:3, :3] = rot
+        t2 = np.eye(4)
+        t2[:3, 3] = center
+        full_xf = t2 @ r4 @ t1
+        return self.transformed(full_xf)
+
+    def align_face_to_axis(self, face_index: int, target_axis: Optional[np.ndarray] = None) -> "Shape":
+        """Rotate shape so that the normal of the specified face aligns with target_axis (default [0,0,1])."""
+        target = np.array([0.0, 0.0, 1.0]) if target_axis is None else np.asarray(target_axis, dtype=float)
+        target = target / np.linalg.norm(target)
+        faces = self.faces()
+        if face_index < 0 or face_index >= len(faces):
+            return self
+        fn = faces[face_index].oriented_normal
+        n_len = np.linalg.norm(fn)
+        if n_len < 1e-6:
+            return self
+        src = fn / n_len
+        dot = np.clip(float(src @ target), -1.0, 1.0)
+        if np.isclose(dot, 1.0):
+            return self
+        if np.isclose(dot, -1.0):
+            ortho = np.array([1.0, 0.0, 0.0]) if abs(src[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+            axis = np.cross(src, ortho)
+            axis = axis / np.linalg.norm(axis)
+            angle = np.pi
+        else:
+            axis = np.cross(src, target)
+            axis = axis / np.linalg.norm(axis)
+            angle = np.arccos(dot)
+
+        from ..coords import rotation_about_axis
+        rot3 = rotation_about_axis(axis, angle)
+        bmin, bmax = self.bounding_box()
+        center = 0.5 * (bmin + bmax)
+        t1 = np.eye(4)
+        t1[:3, 3] = -center
+        r4 = np.eye(4)
+        r4[:3, :3] = rot3
+        t2 = np.eye(4)
+        t2[:3, 3] = center
+        return self.transformed(t2 @ r4 @ t1)
+
     # ---------- extraction ----------
     def faces(self, linear_deflection: float = 0.2, angular_deflection: float = 0.25) -> list[Face]:
         """Extract faces with tessellation, surface kinds, outward normals, area, and wire loops."""
@@ -272,16 +331,18 @@ class Shape:
 
         # Extract wire loops
         wires: list[WireLoop] = []
+        outer_shape = None
         try:
             outer_w = BRepTools.OuterWire_s(occ_face)
-            outer_shape = outer_w.TShape() if outer_w is not None else None
+            if outer_w is not None and hasattr(outer_w, "IsNull") and not outer_w.IsNull():
+                outer_shape = outer_w.TShape()
         except Exception:
             outer_shape = None
 
         wexp = TopExp_Explorer(occ_face, TopAbs_WIRE)
         while wexp.More():
             w = TopoDS.Wire_s(wexp.Current())
-            is_out = (outer_shape is not None and w.TShape() == outer_shape)
+            is_out = (outer_shape is not None and hasattr(w, "IsNull") and not w.IsNull() and w.TShape() == outer_shape)
             wire_pts: list[np.ndarray] = []
             wire_edges: list[int] = []
             eexp = TopExp_Explorer(w, TopAbs_EDGE)

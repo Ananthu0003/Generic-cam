@@ -22,6 +22,31 @@ from ..operations import OpPurpose, PlannedOperation
 from .semantic import MotionSegment, MotionType, Toolpath
 
 
+def _has_self_intersection(polygon: list[np.ndarray]) -> bool:
+    """Check if any non-adjacent edges of a 2D polygon intersect (ray-casting)."""
+    n = len(polygon)
+    if n < 4:
+        return False
+    for i in range(n):
+        a0 = polygon[i]
+        a1 = polygon[(i + 1) % n]
+        for j in range(i + 2, n):
+            if j == (i - 1) % n or (i == 0 and j == n - 1):
+                continue
+            b0 = polygon[j]
+            b1 = polygon[(j + 1) % n]
+            d1 = a1 - a0
+            d2 = b1 - b0
+            cross = d1[0] * d2[1] - d1[1] * d2[0]
+            if abs(cross) < 1e-12:
+                continue
+            t = ((b0[0] - a0[0]) * d2[1] - (b0[1] - a0[1]) * d2[0]) / cross
+            u = ((b0[0] - a0[0]) * d1[1] - (b0[1] - a0[1]) * d1[0]) / cross
+            if 0.0 < t < 1.0 and 0.0 < u < 1.0:
+                return True
+    return False
+
+
 @dataclass
 class StrategyContext:
     """Everything a strategy needs, drawn from the planning context."""
@@ -31,8 +56,9 @@ class StrategyContext:
     mesh: object                     # TriangleMesh of model in setup space
     stock_voxels: object             # VoxelStock: current remaining stock state
     clearance_z: float               # setup-space Z for safe rapids (derived)
-    finish_allowance_wall: float     # from config, domain default
+    finish_allowance_wall: float     # from FinishRequirement or config default
     finish_allowance_floor: float
+    ramp_angle_deg: float = 15.0     # ramp entry angle (deg); lower for harder materials
 
 
 class StrategyEngine:
@@ -67,6 +93,12 @@ class StrategyEngine:
             return self._tapping(op)
         if op.purpose is OpPurpose.CHAMFERING:
             return self._chamfering(op)
+        if op.purpose is OpPurpose.COUNTERSINKING:
+            return self._countersinking(op)
+        if op.purpose is OpPurpose.THREAD_MILLING:
+            return self._thread_milling(op)
+        if op.purpose is OpPurpose.GROOVING:
+            return self._grooving(op)
         raise CamError(UNSUPPORTED_FEATURE,
                        f"no strategy for purpose {op.purpose}", stage="toolpath",
                        operation_id=op.id)
@@ -130,6 +162,31 @@ class StrategyEngine:
             feed=feed or op.params.feed_rate, spindle=op.params.spindle_rpm,
             tool_id=op.tool.id, operation_id=op.id, feature_id=op.feature.id))
 
+    def _adaptive_feed(self, base_feed: float, engagement_angle_deg: float,
+                       max_engagement_deg: float = 180.0) -> float:
+        """Adjust feed rate based on engagement angle for constant chip thickness.
+        Higher engagement = slower feed to maintain load; lower engagement = faster feed.
+        This is the core of adaptive/trochoidal roughing efficiency."""
+        if max_engagement_deg <= 0:
+            return base_feed
+        # Scale feed inversely with engagement ratio
+        ratio = engagement_angle_deg / max_engagement_deg
+        # Clamp between 30% and 200% of base feed
+        scale = max(0.3, min(2.0, 1.0 / max(ratio, 0.1)))
+        return base_feed * scale
+
+    def _estimate_engagement(self, tool_diameter: float, stepover_mm: float) -> float:
+        """Estimate engagement angle from stepover (radial depth of cut).
+        For a flat endmill: ae = D * (1 - cos(theta/2)) -> theta = 2*acos(1 - 2*ae/D)
+        Returns angle in degrees."""
+        ae = stepover_mm
+        D = tool_diameter
+        if ae >= D:
+            return 180.0  # full slot
+        ratio = 1.0 - 2.0 * ae / D
+        ratio = max(-1.0, min(1.0, ratio))
+        return math.degrees(2.0 * math.acos(ratio))
+
     def _rapid_to(self, tp: Toolpath, op: PlannedOperation, p: np.ndarray) -> None:
         last = self._seg_end(tp)
         tp.add(MotionSegment(motion_type=MotionType.RAPID, start=last,
@@ -157,6 +214,13 @@ class StrategyEngine:
         center = np.asarray(center[:2], float)
         z = top_z
         n_seg_per_rev = 12
+        p_start = self._v3(center[0] + radius, center[1], top_z)
+        last = self._seg_end(tp)
+        if np.linalg.norm(last - p_start) > 1e-4:
+            if abs(last[2] - top_z) > 1e-4:
+                self._rapid_to(tp, op, self._v3(p_start[0], p_start[1], max(last[2], top_z)))
+            self._rapid_to(tp, op, p_start)
+
         while z > bottom_z + 1e-9:
             z_next = max(bottom_z, z - pitch)
             for k in range(1, n_seg_per_rev + 1):
@@ -177,24 +241,44 @@ class StrategyEngine:
             z = z_next
 
     # ---- linking primitives ----
-    def _link_to(self, tp: Toolpath, op: PlannedOperation, p: np.ndarray) -> None:
-        """Retract to clearance, rapid, descend to feed height (with safe retract)."""
+    def _link_to(self, tp: Toolpath, op: PlannedOperation, p: np.ndarray,
+                 approach_offset: float = 1.0) -> None:
+        """Retract to clearance, rapid to XY, rapid down to approach Z, plunge to target Z."""
         last = self._seg_end(tp)
-        safe_z = p[2] + self.s.context.machine.safe_retract_height + \
-            max(1.0, op.tool.diameter * 0.5)
-        # retract
-        tp.add(MotionSegment(
-            motion_type=MotionType.RETRACT, start=last,
-            end=self._v3(last[0], last[1], self.s.clearance_z),
-            tool_id=op.tool.id, operation_id=op.id, feature_id=op.feature.id))
-        # rapid across
-        self._rapid_to(tp, op, self._v3(p[0], p[1], self.s.clearance_z))
-        # descend to feed start height
-        tp.add(MotionSegment(
-            motion_type=MotionType.RAPID,
-            start=self._v3(p[0], p[1], self.s.clearance_z),
-            end=self._v3(p[0], p[1], safe_z),
-            tool_id=op.tool.id, operation_id=op.id, feature_id=op.feature.id))
+        p_target = np.asarray(p, dtype=float)
+        clearance_z = self.s.clearance_z
+        approach_z = min(clearance_z, p_target[2] + approach_offset)
+
+        # 1. Retract to clearance if not already there
+        if abs(last[2] - clearance_z) > 1e-4:
+            tp.add(MotionSegment(
+                motion_type=MotionType.RETRACT, start=last,
+                end=self._v3(last[0], last[1], clearance_z),
+                tool_id=op.tool.id, operation_id=op.id, feature_id=op.feature.id))
+            last = self._seg_end(tp)
+
+        # 2. Rapid across in XY at clearance height
+        if np.linalg.norm(last[:2] - p_target[:2]) > 1e-4:
+            self._rapid_to(tp, op, self._v3(p_target[0], p_target[1], clearance_z))
+
+        # 3. Rapid descend to approach height (e.g. target_z + 1mm)
+        if abs(clearance_z - approach_z) > 1e-4:
+            tp.add(MotionSegment(
+                motion_type=MotionType.RAPID,
+                start=self._v3(p_target[0], p_target[1], clearance_z),
+                end=self._v3(p_target[0], p_target[1], approach_z),
+                tool_id=op.tool.id, operation_id=op.id, feature_id=op.feature.id))
+
+        # 4. Controlled plunge to target Z level
+        if abs(approach_z - p_target[2]) > 1e-4:
+            plunge_feed = op.params.plunge_feed if op.params.plunge_feed else 300.0
+            tp.add(MotionSegment(
+                motion_type=MotionType.PLUNGE,
+                start=self._v3(p_target[0], p_target[1], approach_z),
+                end=self._v3(p_target[0], p_target[1], p_target[2]),
+                feed=plunge_feed,
+                spindle=op.params.spindle_rpm,
+                tool_id=op.tool.id, operation_id=op.id, feature_id=op.feature.id))
 
     def _link_stay_down(self, tp: Toolpath, op: PlannedOperation,
                         p: np.ndarray, clearance_above: float = 2.0) -> None:
@@ -213,11 +297,13 @@ class StrategyEngine:
             start=self._v3(last[0], last[1], retract_z),
             end=self._v3(p[0], p[1], retract_z),
             tool_id=op.tool.id, operation_id=op.id, feature_id=op.feature.id))
-        # descend
+        # descend at feed rate — stay-down uses controlled descent
+        descent_feed = op.params.feed_rate * 0.5 if op.params.feed_rate else 100.0
         tp.add(MotionSegment(
-            motion_type=MotionType.RAPID,
+            motion_type=MotionType.PLUNGE,
             start=self._v3(p[0], p[1], retract_z),
             end=self._v3(p[0], p[1], p[2]),
+            feed=descent_feed,
             tool_id=op.tool.id, operation_id=op.id, feature_id=op.feature.id))
 
     def _arc_lead_in(self, tp: Toolpath, op: PlannedOperation,
@@ -265,60 +351,140 @@ class StrategyEngine:
                       target: np.ndarray, helix_radius: float,
                       pitch: float) -> None:
         """Helical descent into pocket at the target XY location."""
-        top_z = self._seg_end(tp)[2]
+        feat_top = getattr(op.feature, 'top_z', target[2] + 5.0)
+        top_z = min(self._seg_end(tp)[2], feat_top + 1.0)
         bottom_z = target[2]
-        self._helical_entry(tp, op, target, helix_radius, top_z, bottom_z, pitch)
+        if top_z > bottom_z + 1e-6:
+            self._helical_entry(tp, op, target, helix_radius, top_z, bottom_z, pitch)
         # finish at exact target point
         prev = self._seg_end(tp)
-        self._add_cut(tp, op, target, feed=op.params.feed_rate)
+        if np.linalg.norm(prev - target) > 1e-4:
+            self._add_cut(tp, op, target, feed=op.params.feed_rate)
 
-    # ---- polygon offset helpers for boundary-conforming roughing ----
-    @staticmethod
-    def _offset_polygon(polygon: list[np.ndarray], offset: float) -> list[np.ndarray]:
+    def _offset_polygon(self, polygon: list[np.ndarray], offset: float) -> list[np.ndarray]:
         """Offset a 2D polygon inward (negative offset) or outward (positive).
-        Uses Minkowski-sum clipping via vertex normal approach."""
+        Uses shapely when available (production-quality, handles concave/complex polygons);
+        falls back to edge-parallel intersection math for environments without shapely."""
+        try:
+            from shapely.geometry import Polygon as _ShapelyPoly
+            if len(polygon) < 3:
+                return polygon[:]
+            pts = [(float(p[0]), float(p[1])) for p in polygon]
+            poly = _ShapelyPoly(pts)
+            if not poly.is_valid:
+                poly = poly.buffer(0)  # repair self-intersections
+            result_geom = poly.buffer(offset, join_style=2, cap_style=3)
+            if result_geom.is_empty:
+                return []
+            # MultiPolygon: take the largest piece
+            if hasattr(result_geom, 'geoms'):
+                result_geom = max(result_geom.geoms, key=lambda g: g.area)
+            coords = list(result_geom.exterior.coords)[:-1]  # exclude closing duplicate
+            return [np.array([x, y], dtype=float) for x, y in coords]
+        except ImportError:
+            return self._offset_polygon_fallback(polygon, offset)
+
+    @staticmethod
+    def _offset_polygon_fallback(polygon: list[np.ndarray], offset: float) -> list[np.ndarray]:
+        """Fallback edge-parallel polygon offset (used when shapely is unavailable).
+        Handles convex and simple concave polygons via consecutive edge intersections."""
         n = len(polygon)
         if n < 3:
             return polygon[:]
-        result = []
+        offset_edges = []
         for i in range(n):
-            p = polygon[i]
-            prev_pt = polygon[(i - 1) % n]
-            next_pt = polygon[(i + 1) % n]
-            # edge vectors
-            e1 = p - prev_pt
-            e2 = next_pt - p
-            # inward normals (pointing left of edge direction)
-            n1 = np.array([-e1[1], e1[0]], dtype=float)
-            n2 = np.array([-e2[1], e2[0]], dtype=float)
-            n1_len = np.linalg.norm(n1)
-            n2_len = np.linalg.norm(n2)
-            if n1_len < 1e-12 or n2_len < 1e-12:
-                result.append(p.copy())
+            p0 = polygon[i]
+            p1 = polygon[(i + 1) % n]
+            edge = p1 - p0
+            edge_len = np.linalg.norm(edge)
+            if edge_len < 1e-12:
                 continue
-            n1 /= n1_len
-            n2 /= n2_len
-            # bisector
-            bisector = n1 + n2
-            bisector_len = np.linalg.norm(bisector)
-            if bisector_len < 1e-12:
-                result.append(p + n1 * offset)
-                continue
-            bisector /= bisector_len
-            # offset distance along bisector
-            dot = n1 @ bisector
-            if abs(dot) < 1e-12:
-                result.append(p + n1 * offset)
-                continue
-            d = offset / dot
-            result.append(p + bisector * d)
-        return result
+            normal = np.array([-edge[1], edge[0]], dtype=float) / edge_len
+            op0 = p0 + normal * offset
+            op1 = p1 + normal * offset
+            offset_edges.append((op0, op1))
+        if len(offset_edges) < 3:
+            return polygon[:]
+        result = []
+        m = len(offset_edges)
+        for i in range(m):
+            _, e0_end = offset_edges[i]
+            e1_start, _ = offset_edges[(i + 1) % m]
+            d0 = e0_end - offset_edges[i][0]
+            d1 = offset_edges[(i + 1) % m][1] - e1_start
+            cross = d0[0] * d1[1] - d0[1] * d1[0]
+            if abs(cross) < 1e-12:
+                result.append(e0_end.copy())
+            else:
+                w = offset_edges[i][0] - e1_start
+                t = (d1[0] * w[1] - d1[1] * w[0]) / cross
+                result.append(offset_edges[i][0] + t * d0)
+        if len(result) < 3:
+            return result
+        cleaned = [result[0]]
+        for pt in result[1:]:
+            if np.linalg.norm(pt - cleaned[-1]) > 1e-9:
+                cleaned.append(pt)
+        if len(cleaned) > 2 and np.linalg.norm(cleaned[0] - cleaned[-1]) < 1e-9:
+            cleaned.pop()
+        if len(cleaned) < 3:
+            return result
+        if _has_self_intersection(cleaned):
+            return []
+        return cleaned
+
+    @staticmethod
+    def _convex_hull_2d(points: list[np.ndarray]) -> list[np.ndarray]:
+        """Compute 2D convex hull using Monotone Chain algorithm."""
+        pts = sorted(set((float(round(p[0], 4)), float(round(p[1], 4))) for p in points))
+        if len(pts) <= 2:
+            return [np.array(p, dtype=float) for p in pts]
+
+        def cross(o, a, b):
+            return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+        lower = []
+        for p in pts:
+            while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+                lower.pop()
+            lower.append(p)
+
+        upper = []
+        for p in reversed(pts):
+            while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+                upper.pop()
+            upper.append(p)
+
+        hull = lower[:-1] + upper[:-1]
+        return [np.array(p, dtype=float) for p in hull]
 
     def _feature_boundary_polygon(self, f: MachiningFeature) -> list[np.ndarray]:
         """Extract a 2D boundary polygon from the feature's wall faces.
-        Falls back to bounding-box if wall face geometry is unavailable."""
+        Uses actual boundary_loop when available, then convex hull of face points, falls back to bounding-box."""
+        # Use actual boundary geometry if the recognizer extracted it
+        if f.boundary_loop and len(f.boundary_loop) >= 3:
+            return [np.array([p[0], p[1]], dtype=float) for p in f.boundary_loop]
+
+        # Check if we can build a polygon from mesh triangles of the feature faces
+        if hasattr(self.s, "mesh") and self.s.mesh is not None and hasattr(self.s.mesh, "triangles"):
+            tris = self.s.mesh.triangles
+            if len(tris) > 0 and (f.floor_faces or f.face_indices):
+                # Sample vertices within feature bounds
+                bmin, bmax = f.bounds_min, f.bounds_max
+                pts_in_box = []
+                for tri in tris:
+                    for v in tri:
+                        if (bmin[0] - 0.1 <= v[0] <= bmax[0] + 0.1 and
+                            bmin[1] - 0.1 <= v[1] <= bmax[1] + 0.1 and
+                            bmin[2] - 0.5 <= v[2] <= bmax[2] + 0.5):
+                            pts_in_box.append(v[:2])
+                if len(pts_in_box) >= 3:
+                    hull = self._convex_hull_2d(pts_in_box)
+                    if len(hull) >= 3:
+                        return hull
+
+        # Fallback: bounding-box rectangle
         bmin, bmax = f.bounds_min[:2], f.bounds_max[:2]
-        # default: bounding-box rectangle
         return [
             np.array([bmin[0], bmin[1]]),
             np.array([bmax[0], bmin[1]]),
@@ -329,7 +495,9 @@ class StrategyEngine:
     def _contour_parallel_passes(self, f: MachiningFeature, tool_radius: float,
                                  finish_wall: float, stepover: float,
                                  z: float) -> list[list[np.ndarray]]:
-        """Generate offset polygon contour passes at a given Z level."""
+        """Generate offset polygon contour passes at a given Z level.
+        Handles islands (internal obstacles) by generating offset contours
+        around both the outer boundary and each island."""
         boundary = self._feature_boundary_polygon(f)
         inset0 = tool_radius + finish_wall
         bmin = np.min(boundary, axis=0)
@@ -337,17 +505,50 @@ class StrategyEngine:
         extents = bmax - bmin
         min_extent = float(np.min(extents))
         n_offsets = max(1, int(np.ceil((min_extent / 2.0 - inset0) / stepover)) + 1)
-        passes = []
+        passes: list[list[np.ndarray]] = []
+        # For outer contours / convex bosses: offset outward from part boundary into stock margin
+        if not f.is_concave or f.type in (FeatureType.CONTOUR, FeatureType.BOSS):
+            stock_bmin = self.s.setup.stock.bounds_min[:2]
+            stock_bmax = self.s.setup.stock.bounds_max[:2]
+            margin = max(float(np.max(stock_bmax - bmax)), float(np.max(bmin - stock_bmin)), 0.0)
+            n_offsets = max(1, int(np.ceil((margin + inset0) / stepover)) + 1)
+            for oi in range(n_offsets):
+                outset = inset0 + (n_offsets - 1 - oi) * stepover
+                offset_poly = self._offset_polygon(boundary, outset)
+                if len(offset_poly) >= 3:
+                    pts = [self._v3(p[0], p[1], z) for p in offset_poly]
+                    passes.append(pts)
+            return passes
+
+        # Generate offset contours from outer boundary (inward)
         for oi in range(n_offsets):
             inset = inset0 + oi * stepover
             offset_poly = self._offset_polygon(boundary, -inset)
-            # filter degenerate offsets
             area = self._polygon_area(offset_poly)
             if area < 1e-6:
                 continue
-            # convert to 3D points at z
             pts = [self._v3(p[0], p[1], z) for p in offset_poly]
             passes.append(pts)
+
+        # Generate offset contours from islands (outward from island boundary)
+        # Clip: only include island contours whose centroid is inside the outer boundary
+        if f.island_loops:
+            for island in f.island_loops:
+                if not island or len(island) < 3:
+                    continue
+                for oi in range(n_offsets):
+                    inset = inset0 + oi * stepover
+                    offset_poly = self._offset_polygon(island, inset)
+                    area = self._polygon_area(offset_poly)
+                    if area < 1e-6:
+                        continue
+                    # Clip: check if island centroid is inside the outer boundary
+                    centroid = np.mean(offset_poly, axis=0)
+                    if not self._point_in_polygon(centroid, boundary):
+                        continue
+                    pts = [self._v3(p[0], p[1], z) for p in offset_poly]
+                    passes.append(pts)
+
         return passes
 
     @staticmethod
@@ -362,6 +563,21 @@ class StrategyEngine:
             area += poly[i][0] * poly[j][1]
             area -= poly[j][0] * poly[i][1]
         return abs(area) * 0.5
+
+    @staticmethod
+    def _point_in_polygon(point: np.ndarray, polygon: list[np.ndarray]) -> bool:
+        """Ray-casting point-in-polygon test."""
+        n = len(polygon)
+        inside = False
+        x, y = point[0], point[1]
+        j = n - 1
+        for i in range(n):
+            xi, yi = polygon[i][0], polygon[i][1]
+            xj, yj = polygon[j][0], polygon[j][1]
+            if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi):
+                inside = not inside
+            j = i
+        return inside
 
     # ----------------------------------------------------------- facing --
     def _facing(self, op: PlannedOperation) -> Toolpath:
@@ -398,8 +614,8 @@ class StrategyEngine:
         z = top_z
         passes = 0
         while z > target_z + 1e-9:
-            z = max(target_z, z - stepdown)
             passes += 1
+            z = max(target_z, top_z - passes * stepdown)
             direction = 1 if passes % 2 == 1 else -1
             for row in range(n_rows):
                 y_index = row if direction == 1 else n_rows - 1 - row
@@ -407,8 +623,6 @@ class StrategyEngine:
                 x0, x1 = (r_min[0], r_max[0]) if row % 2 == 0 else (r_max[0], r_min[0])
                 if row == 0:
                     self._link_to(tp, op, self._v3(x0, y, z))
-                    self._ramp_entry(tp, op, self._v3(x0, y, z),
-                                     along=np.array([1.0, 0.0, 0.0]))
                 else:
                     self._add_cut(tp, op, self._v3(x0, y, z))
                 self._add_cut(tp, op, self._v3(x1, y, z))
@@ -480,7 +694,8 @@ class StrategyEngine:
 
     def _ramp_entry(self, tp: Toolpath, op: PlannedOperation, target: np.ndarray,
                     along: np.ndarray) -> None:
-        """Ramp entry into material along `along` direction, respecting ramp feed."""
+        """Ramp entry into material along `along` direction, respecting ramp feed.
+        Ramp angle is taken from StrategyContext.ramp_angle_deg (default 15°)."""
         params = op.params
         end = np.asarray(target, dtype=float)
         prev = self._seg_end(tp)
@@ -491,15 +706,35 @@ class StrategyEngine:
                                  tool_id=op.tool.id, operation_id=op.id,
                                  feature_id=op.feature.id))
             return
+
+        # Localized ramp entry: ramp from approach height just above target
+        # rather than all the way from clearance height
+        ramp_dz = min(abs(dz), max(params.depth_of_cut_mm, 2.0))
+        start_z = end[2] + ramp_dz
+
         horizontal = np.array([along[0], along[1]], dtype=float)
         nh = np.linalg.norm(horizontal)
         if nh < 1e-9:
             horizontal = np.array([1.0, 0.0])
             nh = 1.0
         horizontal = horizontal / nh
-        ramp_len = abs(dz) / math.tan(math.radians(15.0))
+        ramp_angle = getattr(self.s, 'ramp_angle_deg', 15.0)
+        ramp_len = ramp_dz / math.tan(math.radians(ramp_angle))
+
+        # Keep ramp length constrained within feature bounds
+        if hasattr(op.feature, 'xy_extent') and len(op.feature.xy_extent) > 0:
+            max_extent = float(max(op.feature.xy_extent))
+            ramp_len = min(ramp_len, max(3.0, max_extent * 0.4))
+
         a = end[:2] - horizontal * ramp_len
-        start = self._v3(a[0], a[1], end[2] - dz)
+        start = self._v3(a[0], a[1], start_z)
+
+        # Ensure tool reaches start position before ramping
+        if np.linalg.norm(prev - start) > 1e-6:
+            if prev[2] < start_z:
+                self._rapid_to(tp, op, self._v3(prev[0], prev[1], start_z))
+            self._rapid_to(tp, op, start)
+
         tp.add(MotionSegment(motion_type=MotionType.RAMP, start=start, end=end,
                              feed=params.ramp_feed, spindle=params.spindle_rpm,
                              tool_id=op.tool.id, operation_id=op.id,
@@ -599,53 +834,56 @@ class StrategyEngine:
         """High-efficiency cavity milling: full axial depth, reduced radial stepover,
         with trochoidal motion to maintain constant engagement."""
         radius = tool.diameter / 2.0
-        bmin, bmax = f.bounds_min[:2], f.bounds_max[:2]
-        cx = 0.5 * (bmin[0] + bmax[0])
-        cy = 0.5 * (bmin[1] + bmax[1])
-        extents = bmax - bmin
         finish_wall = self.s.finish_allowance_wall
+
+        # Use actual feature boundary polygon (not bounding box)
+        boundary = self._feature_boundary_polygon(f)
+        if not boundary or len(boundary) < 3:
+            return
 
         # reduced stepover for adaptive: 10-20% of tool diameter
         ae = tool.diameter * 0.15
+        # engagement-aware feed: estimate engagement angle from stepover
+        eng_angle = self._estimate_engagement(tool.diameter, ae)
+        adapted_feed = self._adaptive_feed(params.feed_rate, eng_angle, 180.0)
         # full depth of cut per level
         z = top_z
         first_entry = True
         while z > floor_z + 1e-9:
             z_level = max(floor_z, z - stepdown)
-            # contour-parallel offset paths with reduced ae
+            # contour-parallel offset paths using actual boundary polygon
             inset0 = radius + finish_wall
-            n_offsets = max(1, int(np.ceil((min(extents) / 2.0 - inset0) / ae)) + 1)
-            for oi in range(n_offsets):
-                inset = inset0 + oi * ae
-                hx = extents[0] / 2.0 - inset
-                hy = extents[1] / 2.0 - inset
-                if hx < -1e-9 or hy < -1e-9:
-                    continue
-                # offset rectangle corners
-                corners = [
-                    self._v3(cx - hx, cy - hy, z_level),
-                    self._v3(cx + hx, cy - hy, z_level),
-                    self._v3(cx + hx, cy + hy, z_level),
-                    self._v3(cx - hx, cy + hy, z_level),
-                ]
-                if hx <= 1e-9 and hy <= 1e-9:
-                    corners = corners[:1]
-                if first_entry and oi == 0:
-                    self._link_to(tp, op, corners[0])
-                    self._helical_ramp(tp, op, corners[0],
-                                       helix_radius=min(hx, hy) * 0.4,
+            # generate offset contours inward from original boundary (not accumulating)
+            offset_pass = 0
+            while True:
+                inset = inset0 + offset_pass * ae
+                offset_poly = self._offset_polygon(boundary, -inset)
+                if not offset_poly or len(offset_poly) < 3:
+                    break
+                # check if offset polygon is too small
+                areas = [abs(self._polygon_area(offset_poly))]
+                if areas[0] < 1e-6:
+                    break
+                # generate cut path along offset polygon
+                pts_3d = [self._v3(p[0], p[1], z_level) for p in offset_poly]
+                if first_entry:
+                    self._link_to(tp, op, pts_3d[0])
+                    self._helical_ramp(tp, op, pts_3d[0],
+                                       helix_radius=min(ae, radius * 0.3),
                                        pitch=min(stepdown, tool.diameter * 0.3))
                     first_entry = False
                 else:
                     prev_end = self._seg_end(tp)
-                    dist = np.linalg.norm(corners[0][:2] - prev_end[:2])
+                    dist = np.linalg.norm(pts_3d[0][:2] - prev_end[:2])
                     if dist < tool.diameter:
-                        self._link_stay_down(tp, op, corners[0])
+                        self._link_stay_down(tp, op, pts_3d[0])
                     else:
-                        self._link_to(tp, op, corners[0])
-                for pt in corners[1:]:
-                    self._add_cut(tp, op, pt)
-                self._add_cut(tp, op, corners[0])
+                        self._link_to(tp, op, pts_3d[0])
+                for pt in pts_3d[1:]:
+                    self._add_cut(tp, op, pt, feed=adapted_feed)
+                self._add_cut(tp, op, pts_3d[0], feed=adapted_feed)  # close the loop
+                current_boundary = offset_poly
+                offset_pass += 1
 
     # --------------------------------------------------- rest machining --
     def _rest_machining(self, op: PlannedOperation) -> Toolpath:
@@ -718,33 +956,35 @@ class StrategyEngine:
 
     # -------------------------------------------------- semi-finishing --
     def _semi_finishing(self, op: PlannedOperation) -> Toolpath:
-        """Single offset pass at mid-depth to even out wall stock before finishing."""
+        """Single contour-parallel pass at mid-depth to even out wall stock before finishing.
+        Uses the actual feature boundary shape (via _contour_parallel_passes) rather than
+        a rectangular approximation, so the allowance is uniform on non-rectangular pockets."""
         tp = self._toolpath_skeleton(op)
         self._start_op(tp, op)
         f = op.feature
         tool = op.tool
         params = op.params
         radius = tool.diameter / 2.0
-        bmin, bmax = f.bounds_min, f.bounds_max
-        extents = bmax[:2] - bmin[:2]
         z_target = f.floor_z + self.s.finish_allowance_floor
-        inset = radius + 0.5 * self.s.finish_allowance_wall
-        cx, cy = 0.5 * (bmin[0] + bmax[0]), 0.5 * (bmin[1] + bmax[1])
-        hx = extents[0] / 2.0 - inset
-        hy = extents[1] / 2.0 - inset
-        if hx < 0 or hy < 0:
+
+        # Single contour-parallel pass at half the finish allowance
+        contour_passes = self._contour_parallel_passes(
+            f, radius, 0.5 * self.s.finish_allowance_wall,
+            params.stepover_mm, z_target)
+
+        if not contour_passes:
             tp.metadata["skipped"] = "feature too small for semi-finishing tool"
             self._end_op(tp, op)
             return tp
-        corners = [self._v3(cx - hx, cy - hy, z_target),
-                   self._v3(cx + hx, cy - hy, z_target),
-                   self._v3(cx + hx, cy + hy, z_target),
-                   self._v3(cx - hx, cy + hy, z_target)]
-        pt = corners[0]
+
+        # Take only the first (outermost) pass — semi-finishing is one boundary pass
+        pass_pts = contour_passes[0]
+        pt = pass_pts[0]
         self._link_to(tp, op, pt)
-        self._ramp_entry(tp, op, pt, along=np.array([1.0, 0, 0]))
-        for c in corners[1:] + [corners[0]]:
+        self._ramp_entry(tp, op, pt, along=np.array([1.0, 0.0, 0.0]))
+        for c in pass_pts[1:] + [pass_pts[0]]:
             self._add_cut(tp, op, c)
+
         last = self._seg_end(tp)
         tp.add(MotionSegment(motion_type=MotionType.RETRACT, start=last,
                              end=self._v3(last[0], last[1], self.s.clearance_z),
@@ -783,7 +1023,7 @@ class StrategyEngine:
         bmin, bmax = f.bounds_min, f.bounds_max
         extents = bmax[:2] - bmin[:2]
 
-        wall_inset = radius
+        wall_inset = -radius if (not f.is_concave and f.type in (FeatureType.CONTOUR, FeatureType.BOSS)) else radius
         cx, cy = 0.5 * (bmin[0] + bmax[0]), 0.5 * (bmin[1] + bmax[1])
         hx = extents[0] / 2.0 - wall_inset
         hy = extents[1] / 2.0 - wall_inset
@@ -792,7 +1032,7 @@ class StrategyEngine:
             self._end_op(tp, op)
             return tp
 
-        # wall finishing: full depth contour
+        # wall finishing: full depth contour with cutter compensation (G41)
         z = f.top_z
         floor_z = f.floor_z
         corners = [self._v3(cx - hx, cy - hy, z), self._v3(cx + hx, cy - hy, z),
@@ -801,42 +1041,71 @@ class StrategyEngine:
         self._link_to(tp, op, pt)
         # helical entry down the wall
         self._helical_ramp(tp, op, self._v3(pt[0], pt[1], floor_z),
-                           helix_radius=min(hx, hy) * 0.4,
+                           helix_radius=min(abs(hx), abs(hy)) * 0.4,
                            pitch=min(params.depth_of_cut_mm, tool.diameter * 0.3))
         # contour at floor level, then step up (axial spacing uses depth_of_cut,
         # not the radial stepover)
         doc = max(params.depth_of_cut_mm, 1e-3)
         bands = max(1, int(np.ceil((f.top_z - floor_z) / doc)))
+        comp_d = tool.tool_number if tool.tool_number else 1
+        comp_vec = radius * 0.8  # linear lead-in/out displacement vector
+
         for b in range(bands):
             z_band = min(f.top_z, floor_z + b * doc)
             band_corners = [self._v3(c[0], c[1], z_band) for c in corners]
-            if b == 0:
-                for c in band_corners[1:] + [band_corners[0]]:
-                    self._add_cut(tp, op, c)
-            else:
-                self._link_to(tp, op, band_corners[0])
-                for c in band_corners[1:] + [band_corners[0]]:
-                    self._add_cut(tp, op, c)
+            c0 = band_corners[0]
+            # Approach point slightly inset from c0 for linear G41 engagement
+            approach_pt = self._v3(c0[0] + comp_vec, c0[1] + comp_vec, z_band)
+            departure_pt = self._v3(c0[0] + comp_vec, c0[1] + comp_vec, z_band)
 
-        # floor finishing: serpentine at floor level
-        stepover = max(params.stepover_mm, 1e-3)
-        x0, x1 = bmin[0] + radius, bmax[0] - radius
-        y0, y1 = bmin[1] + radius, bmax[1] - radius
-        if x1 >= x0 and y1 >= y0:
-            n_rows = max(1, int(np.ceil((y1 - y0) / stepover)) + 1)
-            for r in range(n_rows):
-                y = y0 + min(r * stepover, y1 - y0)
-                xa, xb = (x0, x1) if r % 2 == 0 else (x1, x0)
-                row_start = self._v3(xa, y, floor_z)
-                if r == 0:
-                    prev = self._seg_end(tp)
-                    tp.add(MotionSegment(motion_type=MotionType.CUT, start=prev,
-                                         end=row_start, feed=params.feed_rate,
-                                         spindle=params.spindle_rpm, tool_id=tool.id,
-                                         operation_id=op.id, feature_id=f.id))
-                else:
+            if b > 0:
+                self._link_to(tp, op, approach_pt)
+
+            # Linear lead-in move engaging cutter compensation (G41)
+            prev = self._seg_end(tp)
+            tp.add(MotionSegment(
+                motion_type=MotionType.ENTRY,
+                start=prev,
+                end=c0,
+                feed=params.feed_rate,
+                spindle=params.spindle_rpm,
+                tool_id=tool.id,
+                operation_id=op.id,
+                feature_id=f.id,
+                metadata={"cutter_comp": {"side": "left", "action": "on", "d_register": comp_d}}
+            ))
+
+            # Cut around closed contour
+            for c in band_corners[1:] + [band_corners[0]]:
+                self._add_cut(tp, op, c)
+
+            # Linear departure move cancelling cutter compensation (G40)
+            prev = self._seg_end(tp)
+            tp.add(MotionSegment(
+                motion_type=MotionType.EXIT,
+                start=prev,
+                end=departure_pt,
+                feed=params.feed_rate,
+                spindle=params.spindle_rpm,
+                tool_id=tool.id,
+                operation_id=op.id,
+                feature_id=f.id,
+                metadata={"cutter_comp": {"action": "off"}}
+            ))
+
+        # floor finishing: serpentine at floor level (skip for outer contours)
+        if f.type is not FeatureType.CONTOUR:
+            stepover = max(params.stepover_mm, 1e-3)
+            x0, x1 = bmin[0] + radius, bmax[0] - radius
+            y0, y1 = bmin[1] + radius, bmax[1] - radius
+            if x1 >= x0 and y1 >= y0:
+                n_rows = max(1, int(np.ceil((y1 - y0) / stepover)) + 1)
+                for r in range(n_rows):
+                    y = y0 + min(r * stepover, y1 - y0)
+                    xa, xb = (x0, x1) if r % 2 == 0 else (x1, x0)
+                    row_start = self._v3(xa, y, floor_z)
                     self._link_to(tp, op, row_start)
-                self._add_cut(tp, op, self._v3(xb, y, floor_z))
+                    self._add_cut(tp, op, self._v3(xb, y, floor_z))
 
         last = self._seg_end(tp)
         tp.add(MotionSegment(motion_type=MotionType.RETRACT, start=last,
@@ -844,7 +1113,9 @@ class StrategyEngine:
                              tool_id=tool.id, operation_id=op.id, feature_id=f.id))
         self._end_op(tp, op)
         tp.metadata["strategy"] = "wall_floor_contour"
+        tp.metadata["hsm_mode"] = "finishing"
         return tp
+
 
     def _finish_freeform(self, op: PlannedOperation) -> Toolpath:
         """Parallel (raster) finishing with drop-cutter Z from the real mesh,
@@ -898,12 +1169,13 @@ class StrategyEngine:
             if not pts:
                 continue
             if first:
-                start = pts[0] + np.array([0, 0, self.s.clearance_z])
+                start = self._v3(pts[0][0], pts[0][1], self.s.clearance_z)
                 self._rapid_to(tp, op, start)
                 first = False
             else:
                 prev = self._seg_end(tp)
-                link_z = max(prev[2], pts[0][2]) + self.s.context.machine.safe_retract_height
+                retract_h = self.s.context.machine.safe_retract_height or 10.0
+                link_z = max(prev[2], pts[0][2]) + retract_h
                 tp.add(MotionSegment(motion_type=MotionType.LINK, start=prev,
                                      end=self._v3(pts[0][0], pts[0][1], link_z),
                                      tool_id=tool.id, operation_id=op.id,
@@ -1098,12 +1370,13 @@ class StrategyEngine:
             if not pts:
                 continue
             if first:
-                start = pts[0] + np.array([0, 0, self.s.clearance_z])
+                start = self._v3(pts[0][0], pts[0][1], self.s.clearance_z)
                 self._rapid_to(tp, op, start)
                 first = False
             else:
                 prev = self._seg_end(tp)
-                link_z = max(prev[2], pts[0][2]) + self.s.context.machine.safe_retract_height
+                retract_h = self.s.context.machine.safe_retract_height or 10.0
+                link_z = max(prev[2], pts[0][2]) + retract_h
                 tp.add(MotionSegment(motion_type=MotionType.LINK, start=prev,
                                      end=self._v3(pts[0][0], pts[0][1], link_z),
                                      tool_id=tool.id, operation_id=op.id,
@@ -1269,6 +1542,13 @@ class StrategyEngine:
             passes += 1
             if passes == 1:
                 self._link_to(tp, op, self._v3(center[0], center[1], z))
+            else:
+                # retract between Z-passes
+                last = self._seg_end(tp)
+                tp.add(MotionSegment(motion_type=MotionType.RETRACT, start=last,
+                                     end=self._v3(last[0], last[1], self.s.clearance_z),
+                                     tool_id=tool.id, operation_id=op.id, feature_id=f.id))
+                self._link_to(tp, op, self._v3(center[0], center[1], z))
             # spiral path
             total_angle = n_rings * 2 * math.pi
             n_pts = max(12, n_rings * 24)
@@ -1307,13 +1587,15 @@ class StrategyEngine:
         floor_z = f.floor_z
         # approach above hole
         self._rapid_to(tp, op, self._v3(center[0], center[1], self.s.clearance_z))
-        tp.add(MotionSegment(motion_type=MotionType.SPINDLE_START, start=self._v3(0),
-                             end=self._v3(0), spindle=params.spindle_rpm,
-                             tool_id=tool.id, operation_id=op.id, feature_id=f.id))
         depth = top_z - floor_z
         peck = params.depth_of_cut_mm
+        r_plane = top_z + 1.0
         z = top_z
-        prev = self._v3(center[0], center[1], self.s.clearance_z)
+        # rapid down to R-plane before starting canned cycle
+        prev = self._v3(center[0], center[1], r_plane)
+        tp.add(MotionSegment(motion_type=MotionType.RAPID, start=self._v3(center[0], center[1], self.s.clearance_z),
+                             end=prev,
+                             tool_id=tool.id, operation_id=op.id, feature_id=f.id))
         first_plunge = True
         while z > floor_z + 1e-9:
             z_next = max(floor_z, z - peck)
@@ -1323,7 +1605,7 @@ class StrategyEngine:
                 # explicit peck segments remain for simulation/validation.
                 meta = {"canned_cycle": {
                     "type": "G83", "x": float(center[0]), "y": float(center[1]),
-                    "z_r": top_z + 1.0, "z_depth": float(floor_z),
+                    "z_r": float(r_plane), "z_depth": float(floor_z),
                     "peck": float(peck), "feed": params.plunge_feed,
                     "initial_z": float(self.s.clearance_z),
                 }}
@@ -1420,7 +1702,8 @@ class StrategyEngine:
                              end=self._v3(center[0], center[1], floor_z),
                              feed=params.feed_rate, tool_id=tool.id,
                              operation_id=op.id, feature_id=f.id))
-        tp.add(MotionSegment(motion_type=MotionType.RETRACT, start=last,
+        retract_start = self._seg_end(tp)
+        tp.add(MotionSegment(motion_type=MotionType.RETRACT, start=retract_start,
                              end=self._v3(center[0], center[1], self.s.clearance_z),
                              tool_id=tool.id, operation_id=op.id, feature_id=f.id))
         self._end_op(tp, op)
@@ -1429,8 +1712,14 @@ class StrategyEngine:
 
     # ----------------------------------------------------------- boring --
     def _boring(self, op: PlannedOperation) -> Toolpath:
-        """Boring bar operation for precise hole sizing: single-point tool
-        with circular interpolation at the target diameter."""
+        """Boring bar operation: single-point tool fed to depth, spindle stops at bottom,
+        tool shifts off-centre and rapids out (G86 oriented boring cycle).
+
+        Boring bars CANNOT use circular interpolation (G2/G3) — the cutting edge
+        is offset from centre and the tool would gouge the wall on a circular arc.
+        Instead, the strategy emits a single PLUNGE segment annotated with
+        canned_cycle metadata so the post processor emits G86 (or G76 for fine boring).
+        The post is responsible for emitting the correct modal cycle."""
         tp = self._toolpath_skeleton(op)
         self._start_op(tp, op)
         f = op.feature
@@ -1438,75 +1727,62 @@ class StrategyEngine:
         params = op.params
         center = f.center_xy
         top_z, floor_z = f.top_z, f.floor_z
-        r_bore = f.diameter / 2.0 if f.diameter else 0.0
-        if r_bore <= 0:
+        if not f.diameter:
             raise CamError(UNSUPPORTED_FEATURE,
                            f"bore {f.id}: no diameter specified for boring",
                            stage="toolpath", operation_id=op.id, feature_id=f.id)
 
+        r_plane = top_z + 1.0   # R-plane: clearance above bore entry
+        tool_notes = getattr(tool, "notes", {}) or {}
+        fine_boring = bool(op.notes.get("fine_boring") or (tool_notes.get("fine_boring") if isinstance(tool_notes, dict) else False))
+        cycle_type = "G76" if fine_boring else "G86"
+        shift_mm = float(op.notes.get("shift_amount_mm", tool_notes.get("shift_amount_mm", 0.2) if isinstance(tool_notes, dict) else 0.2))
+        # G86: feed to depth → spindle stop → rapid out (roughing/semi boring)
+        # G76: feed to depth → orient spindle → shift tip → rapid out (fine boring)
+
+        # Position over bore at clearance
         self._rapid_to(tp, op, self._v3(center[0], center[1], self.s.clearance_z))
-        # rapid to bore start position
-        self._rapid_to(tp, op, self._v3(center[0] + r_bore, center[1], top_z + 1.0))
-        prev = self._v3(center[0] + r_bore, center[1], top_z + 1.0)
-        tp.add(MotionSegment(motion_type=MotionType.RAPID, start=prev,
-                             end=self._v3(center[0] + r_bore, center[1], top_z + 0.5),
-                             tool_id=tool.id, operation_id=op.id, feature_id=f.id))
-
-        # peck boring cycle
-        peck = params.depth_of_cut_mm
-        z = top_z + 0.5
-        while z > floor_z + 1e-9:
-            z_next = max(floor_z, z - peck)
-            # circular interpolation at bore radius
-            for k in range(1, 13):
-                a0 = 2 * np.pi * (k - 1) / 12
-                a1 = 2 * np.pi * k / 12
-                z_interp = z + (z_next - z) * k / 12
-                p0 = self._v3(center[0] + r_bore * math.cos(a0),
-                              center[1] + r_bore * math.sin(a0), z_interp)
-                p1 = self._v3(center[0] + r_bore * math.cos(a1),
-                              center[1] + r_bore * math.sin(a1), z_interp)
-                tp.add(MotionSegment(motion_type=MotionType.ARC_CCW, start=p0, end=p1,
-                                     arc_center=self._v3(center[0], center[1], z_interp),
-                                     arc_ccw=True, feed=params.feed_rate,
-                                     spindle=params.spindle_rpm, tool_id=tool.id,
-                                     operation_id=op.id, feature_id=f.id))
-            z = z_next
-            if z > floor_z + 1e-9:
-                # retract for chip clear
-                prev = self._seg_end(tp)
-                tp.add(MotionSegment(motion_type=MotionType.RETRACT, start=prev,
-                                     end=self._v3(center[0] + r_bore, center[1],
-                                                  top_z + 1.0),
-                                     tool_id=tool.id, operation_id=op.id,
-                                     feature_id=f.id))
-                tp.add(MotionSegment(motion_type=MotionType.RAPID, start=prev,
-                                     end=self._v3(center[0] + r_bore, center[1],
-                                                  z + 0.5),
-                                     tool_id=tool.id, operation_id=op.id,
-                                     feature_id=f.id))
-
-        # final spring pass at full depth for size accuracy
-        for k in range(1, 13):
-            a0 = 2 * np.pi * (k - 1) / 12
-            a1 = 2 * np.pi * k / 12
-            p0 = self._v3(center[0] + r_bore * math.cos(a0),
-                          center[1] + r_bore * math.sin(a0), floor_z)
-            p1 = self._v3(center[0] + r_bore * math.cos(a1),
-                          center[1] + r_bore * math.sin(a1), floor_z)
-            tp.add(MotionSegment(motion_type=MotionType.ARC_CCW, start=p0, end=p1,
-                                 arc_center=self._v3(center[0], center[1], floor_z),
-                                 arc_ccw=True, feed=params.feed_rate * 0.5,
-                                 spindle=params.spindle_rpm, tool_id=tool.id,
-                                 operation_id=op.id, feature_id=f.id))
-
-        last = self._seg_end(tp)
-        tp.add(MotionSegment(motion_type=MotionType.RETRACT, start=last,
-                             end=self._v3(center[0], center[1], self.s.clearance_z),
-                             tool_id=tool.id, operation_id=op.id, feature_id=f.id))
+        # Rapid to R-plane
+        tp.add(MotionSegment(
+            motion_type=MotionType.RAPID,
+            start=self._seg_end(tp),
+            end=self._v3(center[0], center[1], r_plane),
+            tool_id=tool.id, operation_id=op.id, feature_id=f.id))
+        # Single canned-cycle plunge to full depth
+        canned_dict = {
+            "type": cycle_type,
+            "x": float(center[0]), "y": float(center[1]),
+            "z_r": float(r_plane), "z_depth": float(floor_z),
+            "feed": params.plunge_feed,
+            "initial_z": float(self.s.clearance_z),
+            "bore_diameter": float(f.diameter),
+        }
+        if fine_boring:
+            canned_dict["shift"] = shift_mm
+        tp.add(MotionSegment(
+            motion_type=MotionType.PLUNGE,
+            start=self._v3(center[0], center[1], r_plane),
+            end=self._v3(center[0], center[1], floor_z),
+            feed=params.plunge_feed, spindle=params.spindle_rpm,
+            tool_id=tool.id, operation_id=op.id, feature_id=f.id,
+            metadata={"canned_cycle": canned_dict}))
+        # Retract after spindle stop (G86 semantics: rapid out from bore centre)
+        tp.add(MotionSegment(
+            motion_type=MotionType.RETRACT,
+            start=self._v3(center[0], center[1], floor_z),
+            end=self._v3(center[0], center[1], self.s.clearance_z),
+            tool_id=tool.id, operation_id=op.id, feature_id=f.id))
         self._end_op(tp, op)
-        tp.metadata["strategy"] = "boring"
-        tp.metadata["bore_diameter"] = f.diameter
+        tp.metadata["strategy"] = "boring_canned_cycle"
+        intent = {
+            "cycle": cycle_type,
+            "bore_diameter": float(f.diameter),
+            "depth": float(top_z - floor_z),
+            "retract_height": 1.0,
+        }
+        if fine_boring:
+            intent["shift"] = shift_mm
+        tp.metadata["canned_cycle_intent"] = intent
         return tp
 
     # ----------------------------------------------------- spot drilling --
@@ -1638,7 +1914,12 @@ class StrategyEngine:
         """Tapping requires spindle-feed synchronization (rigid tapping G84 or
         spindle-sync feed). This strategy records the tapping intent on the
         toolpath; the post-processor emits the controller-appropriate cycle.
-        Rigid tapping needs a feed-per-revolution feed rate."""
+
+        Feed basis: G84 on Fanuc/Haas-class controllers runs under G94, so F
+        must be mm/min = feed_per_rev * spindle_rpm. If that feed exceeds the
+        machine's Z-axis feed capability, the spindle RPM is reduced until the
+        required feed fits — the reduction is explicit and recorded, never
+        silent."""
         tp = self._toolpath_skeleton(op)
         self._start_op(tp, op)
         f = op.feature
@@ -1663,6 +1944,22 @@ class StrategyEngine:
                            stage="toolpath", operation_id=op.id, feature_id=f.id,
                            tool_id=tool.id)
 
+        rpm = float(params.spindle_rpm)
+        if rpm <= 0:
+            raise CamError(INVALID_TOOLPATH,
+                           f"tapping {f.id}: non-positive spindle rpm",
+                           stage="toolpath", operation_id=op.id, feature_id=f.id,
+                           tool_id=tool.id)
+
+        # G94 tap feed in mm/min: feed_per_rev * rpm. Clamp against the
+        # machine's Z-axis max feed by lowering RPM if needed (rigid tapping
+        # keeps F = pitch * S constant, so RPM is the only free variable).
+        z_axis = self.s.context.machine.axis_for("Z")
+        tap_feed_mm_min = tap_feed * rpm
+        if tap_feed_mm_min > z_axis.max_feed:
+            rpm = z_axis.max_feed / tap_feed
+            tap_feed_mm_min = tap_feed * rpm
+
         self._rapid_to(tp, op, self._v3(center[0], center[1], self.s.clearance_z))
         tp.add(MotionSegment(
             motion_type=MotionType.RAPID, start=self._seg_end(tp),
@@ -1674,13 +1971,14 @@ class StrategyEngine:
             motion_type=MotionType.PLUNGE,
             start=self._v3(center[0], center[1], top_z + 1.0),
             end=self._v3(center[0], center[1], floor_z),
-            feed=tap_feed, spindle=params.spindle_rpm,
+            feed=tap_feed_mm_min, spindle=rpm,
             tool_id=tool.id, operation_id=op.id, feature_id=f.id,
             metadata={"tap_feed_mm_per_rev": tap_feed,
                       "canned_cycle": {
                           "type": "G84", "x": float(center[0]), "y": float(center[1]),
                           "z_r": top_z + 1.0, "z_depth": float(floor_z),
-                          "feed": tap_feed,  # mm/rev: correct F basis for G84
+                          "feed": tap_feed_mm_min,  # G94 basis: mm/min = mm/rev * rpm
+                          "spindle": float(rpm),
                           "initial_z": float(self.s.clearance_z),
                       }}))
 
@@ -1689,7 +1987,7 @@ class StrategyEngine:
             motion_type=MotionType.RETRACT,
             start=self._v3(center[0], center[1], floor_z),
             end=self._v3(center[0], center[1], top_z + 1.0),
-            feed=tap_feed, spindle=params.spindle_rpm,
+            feed=tap_feed_mm_min, spindle=rpm,
             tool_id=tool.id, operation_id=op.id, feature_id=f.id,
             metadata={"tap_feed_mm_per_rev": tap_feed,
                       "spindle_reverse": True}))
@@ -1703,10 +2001,14 @@ class StrategyEngine:
         self._end_op(tp, op)
         tp.metadata["strategy"] = "tapping"
         tp.metadata["tap_feed_mm_per_rev"] = tap_feed
+        tp.metadata["tap_spindle_rpm"] = rpm
+        tp.metadata["tap_feed_mm_min"] = tap_feed_mm_min
         tp.metadata["canned_cycle_intent"] = {
             "position": center.tolist(), "depth": top_z - floor_z,
             "retract_height": 1.0, "cycle": "G84",
-            "feed_mm_per_rev": tap_feed}
+            "feed_mm_per_rev": tap_feed,
+            "feed_mm_min": tap_feed_mm_min,
+            "spindle_rpm": rpm}
         return tp
 
     # ------------------------------------------------------- chamfering --
@@ -1781,4 +2083,165 @@ class StrategyEngine:
         tp.metadata["strategy"] = "chamfer_contour"
         tp.metadata["chamfer_angle_deg"] = angle_deg
         tp.metadata["chamfer_depth_mm"] = chamfer_depth
+        return tp
+
+    # ------------------------------------------------------- thread milling --
+    def _thread_milling(self, op: PlannedOperation) -> Toolpath:
+        """Thread milling: helical interpolation with thread mill tool to cut
+        internal or external threads. Uses multi-pass helical motion with
+        gradual radial engagement."""
+        tp = self._toolpath_skeleton(op)
+        self._start_op(tp, op)
+        f = op.feature
+        tool = op.tool
+        params = op.params
+        center = f.center_xy
+        top_z = f.top_z
+        floor_z = f.floor_z
+        # Thread pitch from notes or default
+        pitch = op.notes.get("pitch", f.diameter * 0.15 if f.diameter else 1.0)
+        thread_depth = op.notes.get("thread_depth", pitch * 1.2)
+        n_passes = max(1, int(math.ceil(thread_depth / (tool.diameter * 0.1))))
+        radial_step = thread_depth / n_passes
+
+        self._rapid_to(tp, op, self._v3(center[0], center[1], self.s.clearance_z))
+
+        for pass_i in range(n_passes):
+            r = (pass_i + 1) * radial_step  # start shallow, deepen each pass
+            # Helical interpolation at this radius: Z descends linearly along the helix
+            z = top_z
+            while z > floor_z + 1e-9:
+                z_next = max(floor_z, z - pitch)
+                n_arc_pts = 12
+                dz_per_pt = (z_next - z) / n_arc_pts
+                for k in range(n_arc_pts):
+                    angle = 2 * math.pi * k / n_arc_pts
+                    x = center[0] + r * math.cos(angle)
+                    y = center[1] + r * math.sin(angle)
+                    pt = self._v3(x, y, z + dz_per_pt * (k + 1))
+                    if pass_i == 0 and z == top_z and k == 0:
+                        self._link_to(tp, op, pt)
+                    else:
+                        self._add_cut(tp, op, pt, feed=params.feed_rate * 0.5)
+                z = z_next
+
+        last = self._seg_end(tp)
+        tp.add(MotionSegment(motion_type=MotionType.RETRACT, start=last,
+                             end=self._v3(last[0], last[1], self.s.clearance_z),
+                             tool_id=tool.id, operation_id=op.id, feature_id=f.id))
+        self._end_op(tp, op)
+        tp.metadata["strategy"] = "thread_milling"
+        tp.metadata["pitch"] = pitch
+        return tp
+
+    # ----------------------------------------------------- countersinking --
+    def _countersinking(self, op: PlannedOperation) -> Toolpath:
+        """Countersink: single-pass plunge to chamfer depth with dwell (G82).
+        A countersink is always a canned-cycle operation — no ramp, no contour.
+        The tool plunges to the depth that produces the correct chamfer diameter,
+        dwells briefly for a clean finish, then retracts rapidly."""
+        tp = self._toolpath_skeleton(op)
+        self._start_op(tp, op)
+        f = op.feature
+        tool = op.tool
+        params = op.params
+        center = f.center_xy
+        top_z = f.top_z
+        floor_z = f.floor_z
+        r_plane = top_z + 1.0
+        dwell_s = 0.2  # seconds at depth for clean countersink chamfer
+
+        # Position over hole centre at clearance height
+        self._rapid_to(tp, op, self._v3(center[0], center[1], self.s.clearance_z))
+        # Rapid down to R-plane
+        tp.add(MotionSegment(
+            motion_type=MotionType.RAPID,
+            start=self._seg_end(tp),
+            end=self._v3(center[0], center[1], r_plane),
+            tool_id=tool.id, operation_id=op.id, feature_id=f.id))
+        # Feed to countersink depth with G82 dwell canned cycle
+        tp.add(MotionSegment(
+            motion_type=MotionType.PLUNGE,
+            start=self._v3(center[0], center[1], r_plane),
+            end=self._v3(center[0], center[1], floor_z),
+            feed=params.plunge_feed, spindle=params.spindle_rpm,
+            tool_id=tool.id, operation_id=op.id, feature_id=f.id,
+            metadata={
+                "canned_cycle": {
+                    "type": "G82",
+                    "x": float(center[0]), "y": float(center[1]),
+                    "z_r": float(r_plane), "z_depth": float(floor_z),
+                    "dwell": dwell_s, "feed": params.plunge_feed,
+                    "initial_z": float(self.s.clearance_z),
+                }
+            }))
+        # Semantic dwell segment (simulation / cycle-time accounting)
+        at_depth = self._v3(center[0], center[1], floor_z)
+        tp.add(MotionSegment(
+            motion_type=MotionType.DWELL,
+            start=at_depth, end=at_depth,
+            dwell_seconds=dwell_s,
+            tool_id=tool.id, operation_id=op.id, feature_id=f.id))
+        # Retract
+        tp.add(MotionSegment(
+            motion_type=MotionType.RETRACT,
+            start=at_depth,
+            end=self._v3(center[0], center[1], self.s.clearance_z),
+            tool_id=tool.id, operation_id=op.id, feature_id=f.id))
+        self._end_op(tp, op)
+        tp.metadata["strategy"] = "countersinking"
+        tp.metadata["canned_cycle_intent"] = {
+            "cycle": "G82", "position": center.tolist(),
+            "depth": float(top_z - floor_z), "dwell_seconds": dwell_s,
+            "countersink_angle_deg": op.notes.get("countersink_angle_deg", 45.0),
+        }
+        return tp
+
+    # --------------------------------------------------------- grooving --
+    def _grooving(self, op: PlannedOperation) -> Toolpath:
+        """Grooving: plunge-cut to create a groove/slot at a specific location.
+        Uses peck plunge for chip breaking, then retract."""
+        tp = self._toolpath_skeleton(op)
+        self._start_op(tp, op)
+        f = op.feature
+        tool = op.tool
+        params = op.params
+        center = f.center_xy
+        top_z = f.top_z
+        floor_z = f.floor_z
+        groove_width = f.diameter if f.diameter else tool.diameter
+        peck_depth = op.notes.get("peck_depth", tool.diameter * 0.3)
+
+        self._rapid_to(tp, op, self._v3(center[0], center[1], self.s.clearance_z))
+        self._rapid_to(tp, op, self._v3(center[0], center[1], top_z + 1.0))
+
+        # Peck plunge
+        z = top_z
+        while z > floor_z + 1e-9:
+            z_next = max(floor_z, z - peck_depth)
+            self._add_cut(tp, op, self._v3(center[0], center[1], z_next),
+                          feed=params.plunge_feed)
+            # Small retract for chip breaking
+            if z_next > floor_z + 1e-9:
+                retract_z = z_next + min(peck_depth * 0.3, 2.0)
+                self._add_cut(tp, op, self._v3(center[0], center[1], retract_z),
+                              feed=params.feed_rate)
+            z = z_next
+
+        # Side-to-side groove widening if groove is wider than tool
+        if groove_width > tool.diameter * 1.5:
+            n_wipes = max(1, int(math.ceil((groove_width - tool.diameter) / (tool.diameter * 0.4))))
+            wipe_step = (groove_width - tool.diameter) / (2 * n_wipes)
+            for wi in range(n_wipes):
+                offset = (wi + 1) * wipe_step
+                for dx in [offset, -offset]:
+                    self._add_cut(tp, op, self._v3(center[0] + dx, center[1], floor_z),
+                                  feed=params.feed_rate * 0.3)
+
+        last = self._seg_end(tp)
+        tp.add(MotionSegment(motion_type=MotionType.RETRACT, start=last,
+                             end=self._v3(last[0], last[1], self.s.clearance_z),
+                             tool_id=tool.id, operation_id=op.id, feature_id=f.id))
+        self._end_op(tp, op)
+        tp.metadata["strategy"] = "grooving"
         return tp

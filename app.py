@@ -33,6 +33,18 @@ STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def serve_favicon():
+    favicon_svg = STATIC_DIR / "favicon.svg"
+    if favicon_svg.exists():
+        return FileResponse(favicon_svg, media_type="image/svg+xml")
+    favicon_ico = STATIC_DIR / "favicon.ico"
+    if favicon_ico.exists():
+        return FileResponse(favicon_ico)
+    from fastapi import Response
+    return Response(status_code=204)
+
+
 @app.get("/")
 async def serve_index():
     index_file = STATIC_DIR / "index.html"
