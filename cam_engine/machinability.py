@@ -118,7 +118,8 @@ class MachinabilityAnalyzer:
 
         # power/torque estimate: MRR = ap * ae * feed/60 (mm3/s)
         mrr = stepdown * stepover * feed / 60.0
-        power = mrr * self.material.specific_cutting_force_kn_mm2 / 60.0  # kW approx
+        # power_kW = MRR_mm3s * Kc_kNmm2 / 1000  (since kN*mm/s = kW)
+        power = mrr * self.material.specific_cutting_force_kn_mm2 / 1000.0
         power = float(min(power, self.machine.max_spindle_power_kw))
         torque = power * 9550.0 / max(rpm, 1.0)
 

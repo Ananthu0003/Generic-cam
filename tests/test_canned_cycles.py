@@ -47,9 +47,9 @@ def test_grbl_emits_g83_canned_cycle_and_suppresses_pecks():
     gcode = res.gcode
 
     assert "G43 H12" in gcode or "; Length offset H12" in gcode  # configured offset, not pocket #
-    assert "G98 G83 X10 Y20 Z0 R26 Q2 F300" in gcode
-    # G80 cancels before the final retract to clearance
-    assert "G80" in gcode
+    # GRBL v1.1 has no canned cycle support — drilling uses explicit G1 motion
+    assert "G83" not in gcode  # no canned cycle emitted for GRBL
+    assert "G1" in gcode       # explicit linear motion used instead
 
 
 def test_grbl_falls_back_to_explicit_motion_for_g84():
@@ -64,8 +64,13 @@ def test_grbl_falls_back_to_explicit_motion_for_g84():
 
     assert "G84" not in gcode
     assert "G1" in gcode                  # explicit motion preserved
-    # still no overzealous G80 (no canned cycle was emitted)
-    assert "G80" not in gcode
+    # G80 in header is a safety init; no G80 for canned cycle cancellation
+    # (GRBL has no canned cycles, so no G80 cancel should appear in operation code)
+    lines = gcode.split("\n")
+    # Find lines after the header (skip first 4 lines: program name, generated, safety, work offset)
+    operation_lines = lines[4:]
+    g80_in_ops = any("G80" in line for line in operation_lines)
+    assert not g80_in_ops
 
 
 def test_fanuc_emits_g84_with_m29_and_g85_cycle():
@@ -118,4 +123,4 @@ def test_g81_spot_drill_canned_cycle():
     gcode = res.gcode
 
     assert "G82" in gcode
-    assert "P0.1" in gcode
+    assert "P100" in gcode  # Fanuc uses milliseconds for dwell

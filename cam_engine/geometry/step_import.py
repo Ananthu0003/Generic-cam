@@ -50,11 +50,20 @@ def import_step(path: str | Path, file_units: Optional[Units] = None) -> Importe
     if reader.NbShapes() < 1:
         raise CamError(INVALID_GEOMETRY, "STEP file contains no shapes", stage="import")
     
-    # Use reader.Shape() to get the full compound / shape
+    # Use reader.Shape() or OneShape() safely
+    occ_shape = None
     try:
         occ_shape = reader.Shape()
+        if occ_shape is not None and hasattr(occ_shape, "IsNull") and occ_shape.IsNull():
+            occ_shape = reader.OneShape()
     except Exception:
-        occ_shape = reader.OneShape()
+        try:
+            occ_shape = reader.OneShape()
+        except Exception:
+            pass
+
+    if occ_shape is None or (hasattr(occ_shape, "IsNull") and occ_shape.IsNull()):
+        raise CamError(INVALID_GEOMETRY, "Failed to extract valid 3D shape from STEP file", stage="import")
 
     # Count faces/solids to ensure machinable geometry exists
     exp_faces = TopExp_Explorer(occ_shape, TopAbs_FACE)

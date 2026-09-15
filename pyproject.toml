@@ -5,6 +5,7 @@ description = "Generic geometry-driven CAM toolpath planning and G-code generati
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
+    "shapely>=2.0",
     "cadquery-ocp",
     "fastapi",
     "uvicorn",
@@ -16,6 +17,7 @@ dev = ["pytest", "httpx"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 addopts = "-q"
 
 [build-system]

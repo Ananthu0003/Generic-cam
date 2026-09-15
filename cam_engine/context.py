@@ -50,6 +50,11 @@ class MachineConfig:
     tool_change_position: Optional[np.ndarray] = None   # machine coords; required
     work_offsets: dict[str, np.ndarray] = field(default_factory=dict)  # "G54" -> machine coords of work origin
     safe_retract_height: Optional[float] = None         # mm above stock top, machine-consistent
+    hsm_enabled: bool = True                            # high-speed lookahead / AICC / G187
+    hsm_roughing_tolerance_mm: float = 0.05             # tolerance for roughing passes
+    hsm_finishing_tolerance_mm: float = 0.005           # tolerance for finishing passes
+    enable_cutter_comp: bool = True                     # G41/G42 wear/control compensation
+
 
     def validate(self) -> None:
         problems = []
@@ -58,7 +63,7 @@ class MachineConfig:
         for axis_name in ("X", "Y", "Z"):
             if axis_name not in self.axes:
                 problems.append(f"missing axis {axis_name}")
-        if self.spindle_max_rpm <= self.spindle_min_rpm > 0:
+        if self.spindle_max_rpm <= self.spindle_min_rpm or self.spindle_min_rpm < 0:
             problems.append("invalid spindle range")
         if self.tool_change_position is None:
             problems.append("tool_change_position not configured")
@@ -88,6 +93,11 @@ class ToolType(str, Enum):
     FACE_MILL = "face_mill"
     BORING_BAR = "boring_bar"
     CHAMFER_MILL = "chamfer_mill"
+    COUNTERSINK_TOOL = "countersink_tool"  # dedicated countersink / spotfacing tool
+    TAP = "tap"
+    REAMER = "reamer"
+    THREAD_MILL = "thread_mill"
+    GROOVE_CUTTER = "groove_cutter"
 
 
 @dataclass
@@ -228,6 +238,18 @@ class Stock:
         )
 
 
+# ---------------------------------------------------------------- fixtures ---
+@dataclass
+class Fixture:
+    """Clamping or holding fixture geometry (vise jaws, toe clamps, fixture plates)."""
+    id: str
+    name: str
+    bounds_min: np.ndarray          # setup space [xmin, ymin, zmin]
+    bounds_max: np.ndarray          # setup space [xmax, ymax, zmax]
+    kind: str = "vise_jaw"          # "vise_jaw", "toe_clamp", "fixture_plate", "custom"
+    mesh: Optional[TriangleMesh] = None
+
+
 # ----------------------------------------------------------------- setups ---
 class WorkOffset(str, Enum):
     G54 = "G54"
@@ -248,7 +270,7 @@ class Setup:
     model_to_setup: np.ndarray          # rigid transform, validated
     work_offset: WorkOffset
     stock: Stock
-    fixtures: list[TriangleMesh] = field(default_factory=list)  # clamping geometry, setup space
+    fixtures: list[Fixture | TriangleMesh] = field(default_factory=list)  # clamping geometry, setup space
     comment: str = ""
 
 

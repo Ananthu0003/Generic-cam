@@ -29,7 +29,10 @@ class OpPurpose(str, Enum):
     SPOT_DRILLING = "spot_drilling"
     REAMING = "reaming"
     TAPPING = "tapping"
+    COUNTERSINKING = "countersinking"  # countersink / spotfacing with conical tool
     CHAMFERING = "chamfering"
+    THREAD_MILLING = "thread_milling"
+    GROOVING = "grooving"
 
 
 @dataclass
@@ -55,6 +58,8 @@ class OperationPlanner:
         self.features = features
         self.analyzer = MachinabilityAnalyzer(context.machine, context.material)
         self._counter: dict[str, int] = {}
+        self.warnings: list[dict] = []
+        self.unmachined_features: list[dict] = []
 
     def _next_id(self, prefix: str) -> str:
         n = self._counter.get(prefix, 0) + 1
@@ -74,7 +79,55 @@ class OperationPlanner:
         ops += self._plan_boring()
         ops += self._plan_reaming()
         ops += self._plan_tapping()
-        return ops
+        ops += self._plan_thread_milling()
+        ops += self._plan_grooving()
+        ops += self._plan_countersinking()
+        # Topological sort: reorder by depends_on dependencies
+        return self._topo_sort(ops)
+
+    @staticmethod
+    def _topo_sort(ops: list[PlannedOperation]) -> list[PlannedOperation]:
+        """Topological sort of operations by depends_on relationships.
+        Operations with no dependencies come first. Within the same
+        dependency level, preserve the original planner ordering."""
+        if not ops:
+            return ops
+        # Build op lookup by id and by feature id
+        op_by_id = {o.id: o for o in ops}
+        # Map feature_id -> list of op ids that depend on it
+        dep_graph: dict[str, list[str]] = {o.id: [] for o in ops}
+        in_degree: dict[str, int] = {o.id: 0 for o in ops}
+        for o in ops:
+            for dep_id in (o.depends_on or []):
+                # dep_id could be a feature id or an operation id
+                # Find the operation that produces this dependency
+                producer = None
+                for candidate in ops:
+                    if candidate.id == dep_id or candidate.feature.id == dep_id:
+                        producer = candidate.id
+                        break
+                if producer and producer != o.id:
+                    dep_graph[producer].append(o.id)
+                    in_degree[o.id] += 1
+        # Kahn's algorithm
+        queue = [oid for oid, deg in in_degree.items() if deg == 0]
+        result = []
+        while queue:
+            # Stable: preserve original order within same level
+            queue.sort(key=lambda oid: ops.index(op_by_id[oid]))
+            oid = queue.pop(0)
+            result.append(op_by_id[oid])
+            for child in dep_graph[oid]:
+                in_degree[child] -= 1
+                if in_degree[child] == 0:
+                    queue.append(child)
+        # If cycle detected, append remaining in original order
+        if len(result) < len(ops):
+            seen = {o.id for o in result}
+            for o in ops:
+                if o.id not in seen:
+                    result.append(o)
+        return result
 
     def _plan_facing(self) -> list[PlannedOperation]:
         ops: list[PlannedOperation] = []
@@ -85,6 +138,8 @@ class OperationPlanner:
             if excess <= 1e-4:
                 continue
             tool = self._pick_facing_tool(f)
+            if tool is None:
+                continue
             params = self.analyzer.analyze(tool, f, OpPurpose.FACING.value, self.setup)
             ops.append(PlannedOperation(
                 id=self._next_id("op_facing"), purpose=OpPurpose.FACING,
@@ -92,15 +147,24 @@ class OperationPlanner:
                 notes={"excess_height": excess}))
         return ops
 
-    def _pick_facing_tool(self, f: MachiningFeature) -> Tool:
-        span = float(np.max(f.xy_extent))
+    def _pick_facing_tool(self, f: MachiningFeature) -> Optional[Tool]:
         candidates = [t for t in self.context.tools
                       if t.type in ToolType_mill()]
         if not candidates:
-            raise CamError(
-                code=UNSUPPORTED_FEATURE,
-                message=f"facing region {f.id}: no milling tool available in library",
-                stage="operation_planning", feature_id=f.id)
+            self.warnings.append({
+                "code": "MISSING_TOOL",
+                "feature_id": f.id,
+                "feature_type": "facing_region",
+                "message": f"facing region {f.id}: no milling tool available in library",
+                "suggested_tool": {
+                    "type": "face_mill",
+                    "diameter": 50.0,
+                    "flute_length": 15.0,
+                    "overall_length": 60.0,
+                    "flutes": 4,
+                }
+            })
+            return None
         # Prefer face mill or larger flat endmill
         face_mills = [t for t in candidates if t.type is ToolType.FACE_MILL]
         pool = face_mills or candidates
@@ -117,31 +181,44 @@ class OperationPlanner:
             if f.type not in roughable:
                 continue
             if f.accessibility is Accessibility.INACCESSIBLE:
-                raise CamError(
-                    code=FEATURE_INACCESSIBLE,
-                    message=f"feature {f.id} ({f.type.value}) inaccessible along tool axis",
-                    stage="operation_planning", feature_id=f.id)
+                self.warnings.append({
+                    "code": "FEATURE_INACCESSIBLE",
+                    "feature_id": f.id,
+                    "feature_type": f.type.value if hasattr(f.type, "value") else str(f.type),
+                    "message": f"feature {f.id} ({f.type.value}) inaccessible along tool axis",
+                })
+                continue
             tool = self._pick_roughing_tool(f)
+            if tool is None:
+                continue
             params = self.analyzer.analyze(tool, f, OpPurpose.ROUGHING.value, self.setup)
             ops.append(PlannedOperation(
                 id=self._next_id("op_rough"), purpose=OpPurpose.ROUGHING,
                 feature=f, tool=tool, params=params))
         return ops
 
-    def _pick_roughing_tool(self, f: MachiningFeature) -> Tool:
+    def _pick_roughing_tool(self, f: MachiningFeature) -> Optional[Tool]:
         extent = f.xy_extent
         min_span = float(min(extent))
-        fit = [t for t in self.context.tools
-               if t.type in ToolType_mill()
-               and t.diameter < min_span]
+        endmills = [t for t in self.context.tools if t.type in (ToolType.FLAT_ENDMILL, ToolType.BULLNOSE_ENDMILL)]
+        fit = [t for t in endmills if t.diameter < min_span]
         if not fit:
-            # Check if any milling tool exists
-            all_mills = [t for t in self.context.tools if t.type in ToolType_mill()]
+            all_mills = endmills or [t for t in self.context.tools if t.type in ToolType_mill()]
             if not all_mills:
-                raise CamError(
-                    code=UNSUPPORTED_FEATURE,
-                    message=f"feature {f.id}: no milling tool available in library",
-                    stage="operation_planning", feature_id=f.id)
+                self.warnings.append({
+                    "code": "MISSING_TOOL",
+                    "feature_id": f.id,
+                    "feature_type": f.type.value if hasattr(f.type, "value") else str(f.type),
+                    "message": f"feature {f.id}: no milling tool available in library",
+                    "suggested_tool": {
+                        "type": "flat_endmill",
+                        "diameter": round(max(min_span * 0.7, 0.5), 2),
+                        "flute_length": round(max((f.depth or 5.0) * 1.25, 5.0), 1),
+                        "overall_length": 50.0,
+                        "flutes": 3,
+                    }
+                })
+                return None
             return min(all_mills, key=lambda t: t.diameter)
         return max(fit, key=lambda t: t.diameter)
 
@@ -152,9 +229,9 @@ class OperationPlanner:
             f = rough.feature
             extent = f.xy_extent
             min_span = float(min(extent))
-            smaller = [t for t in self.context.tools
-                       if t.type in ToolType_mill()
-                       and t.diameter < rough.tool.diameter - 1e-6
+            endmills = [t for t in self.context.tools if t.type in (ToolType.FLAT_ENDMILL, ToolType.BULLNOSE_ENDMILL)]
+            smaller = [t for t in endmills
+                       if t.diameter < rough.tool.diameter - 1e-6
                        and t.diameter < min_span]
             if not smaller:
                 continue
@@ -173,11 +250,11 @@ class OperationPlanner:
         rough_ops = [o for o in prior if o.purpose is OpPurpose.ROUGHING]
         for rough in rough_ops:
             f = rough.feature
-            finish_tools = [t for t in self.context.tools
-                            if t.type in ToolType_mill() and t.diameter < rough.tool.diameter]
+            endmills = [t for t in self.context.tools if t.type in (ToolType.FLAT_ENDMILL, ToolType.BULLNOSE_ENDMILL)]
+            finish_tools = [t for t in endmills if t.diameter < rough.tool.diameter]
             if not finish_tools:
                 continue
-            wall_stock = rough.params.depth_of_cut_mm * 0.5
+            wall_stock = rough.params.stepover_mm * 0.5
             if wall_stock > 1.5 * min(t.diameter for t in finish_tools):
                 tool = max(finish_tools, key=lambda t: t.diameter)
                 params = self.analyzer.analyze(tool, f, OpPurpose.SEMI_FINISHING.value,
@@ -218,12 +295,23 @@ class OperationPlanner:
         elif f.type is FeatureType.CHAMFER:
             chams = [t for t in self.context.tools if t.type is ToolType.CHAMFER_MILL]
             pool = chams or [t for t in self.context.tools if t.type in ToolType_mill()]
-        else:
+        elif f.type is FeatureType.FACING_REGION:
             pool = [t for t in self.context.tools if t.type in ToolType_mill()]
+        else:
+            endmills = [t for t in self.context.tools if t.type in (ToolType.FLAT_ENDMILL, ToolType.BULLNOSE_ENDMILL)]
+            pool = endmills or [t for t in self.context.tools if t.type in ToolType_mill()]
         extent = f.xy_extent
         min_span = float(min(extent)) if len(extent) else 1e9
         fit = [t for t in pool if t.diameter < min_span]
         pool2 = fit or pool
+        # For 2.5D features (pockets, steps, shoulders, contours, etc.), prefer largest tool that fits
+        # for fewer passes and better surface finish
+        if f.type in (FeatureType.POCKET, FeatureType.OPEN_POCKET,
+                      FeatureType.SLOT, FeatureType.OPEN_SLOT,
+                      FeatureType.STEP, FeatureType.SHOULDER,
+                      FeatureType.FACING_REGION, FeatureType.CONTOUR,
+                      FeatureType.PLANAR_WALL, FeatureType.BOSS):
+            return max(pool2, key=lambda t: t.diameter)
         return min(pool2, key=lambda t: t.diameter)
 
     def _plan_spot_drilling(self) -> list[PlannedOperation]:
@@ -270,10 +358,27 @@ class OperationPlanner:
             mills = [t for t in self.context.tools
                      if t.type in ToolType_mill() and t.diameter < f.diameter]
             if not mills:
-                raise CamError(
-                    code=UNSUPPORTED_FEATURE,
-                    message=f"feature {f.id} dia {f.diameter:.2f}mm: no drill or endmill fits",
-                    stage="operation_planning", feature_id=f.id)
+                self.warnings.append({
+                    "code": "MISSING_TOOL",
+                    "feature_id": f.id,
+                    "feature_type": f.type.value if hasattr(f.type, "value") else str(f.type),
+                    "feature_diameter": round(f.diameter, 2),
+                    "depth": round(f.depth, 2) if f.depth else 5.0,
+                    "message": f"Feature {f.id} (dia {f.diameter:.2f}mm): no drill or endmill fits in active library",
+                    "suggested_tool": {
+                        "type": "drill" if f.type in (FeatureType.HOLE, FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE, FeatureType.COUNTERBORE) else "flat_endmill",
+                        "diameter": round(f.diameter, 2) if f.type in (FeatureType.HOLE, FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE, FeatureType.COUNTERBORE) else round(f.diameter * 0.75, 2),
+                        "flute_length": round(max((f.depth or 5.0) * 1.25, 5.0), 1),
+                        "overall_length": round(max((f.depth or 5.0) * 2.0, 30.0), 1),
+                        "flutes": 2,
+                    }
+                })
+                self.unmachined_features.append({
+                    "id": f.id,
+                    "diameter": round(f.diameter, 2),
+                    "type": f.type.value if hasattr(f.type, "value") else str(f.type)
+                })
+                continue
             tool = max(mills, key=lambda t: t.diameter)
             params = self.analyzer.analyze(tool, f, OpPurpose.DRILLING.value, self.setup)
             ops.append(PlannedOperation(
@@ -284,20 +389,31 @@ class OperationPlanner:
 
     def _plan_boring(self) -> list[PlannedOperation]:
         ops: list[PlannedOperation] = []
+        bore_types = (
+            FeatureType.BORE, FeatureType.THROUGH_BORE,
+            FeatureType.BLIND_BORE, FeatureType.COUNTERBORE,
+        )
         for f in self.features:
-            if f.type not in (FeatureType.BORE, FeatureType.COUNTERBORE) or f.diameter is None:
+            if f.type not in bore_types or f.diameter is None:
                 continue
             boring_bars = [t for t in self.context.tools if t.type is ToolType.BORING_BAR]
             if not boring_bars:
                 continue
-            exact = [b for b in boring_bars if abs(b.diameter - f.diameter) < 1.0]
+            exact = [b for b in boring_bars if abs(b.diameter - f.diameter) < 0.05]
             if not exact:
                 continue
             tool = exact[0]
             params = self.analyzer.analyze(tool, f, OpPurpose.BORING.value, self.setup)
+            # Boring must follow whatever drilled the pre-bore pilot hole.
+            # The topo_sort resolves feature-id references: any prior op whose
+            # feature.id == dep_id is ordered before this boring op.
+            deps = [f.id]  # resolves to the drilling/helical op on this feature
+            if f.parent_feature_id:
+                # Also depend on the counterbore parent's ops
+                deps.append(f.parent_feature_id)
             ops.append(PlannedOperation(
                 id=self._next_id("op_bore"), purpose=OpPurpose.BORING,
-                feature=f, tool=tool, params=params))
+                feature=f, tool=tool, params=params, depends_on=deps))
         return ops
 
     def _plan_reaming(self) -> list[PlannedOperation]:
@@ -306,30 +422,109 @@ class OperationPlanner:
             if f.type not in (FeatureType.HOLE, FeatureType.THROUGH_HOLE, FeatureType.BORE) or f.diameter is None:
                 continue
             reamers = [t for t in self.context.tools
-                       if t.type is ToolType.DRILL and "ream" in t.id.lower()]
+                       if t.type is ToolType.REAMER or "ream" in t.id.lower()]
             exact = [r for r in reamers if abs(r.diameter - f.diameter) < 0.05]
             if not exact:
                 continue
             tool = exact[0]
             params = self.analyzer.analyze(tool, f, OpPurpose.REAMING.value, self.setup)
+            # Reaming requires a pre-drilled hole — declare dependency on the feature
             ops.append(PlannedOperation(
                 id=self._next_id("op_ream"), purpose=OpPurpose.REAMING,
-                feature=f, tool=tool, params=params))
+                feature=f, tool=tool, params=params, depends_on=[f.id]))
         return ops
 
     def _plan_tapping(self) -> list[PlannedOperation]:
         ops: list[PlannedOperation] = []
+        # Standard metric thread pitch lookup (diameter -> pitch in mm)
+        _metric_pitch = {
+            2.0: 0.4, 2.5: 0.45, 3.0: 0.5, 3.5: 0.6, 4.0: 0.7,
+            5.0: 0.8, 6.0: 1.0, 8.0: 1.25, 10.0: 1.5, 12.0: 1.75,
+            14.0: 2.0, 16.0: 2.0, 18.0: 2.5, 20.0: 2.5, 22.0: 2.5,
+            24.0: 3.0, 27.0: 3.0, 30.0: 3.5, 33.0: 3.5, 36.0: 4.0,
+        }
         for f in self.features:
-            if not f.notes.get("tapped") or f.diameter is None:
+            # Accept TAPPED_HOLE feature type or notes["tapped"] for backward compatibility
+            if f.type is not FeatureType.TAPPED_HOLE and not f.notes.get("tapped"):
                 continue
-            taps = [t for t in self.context.tools if t.type is ToolType.DRILL and "tap" in t.id.lower()]
+            if f.diameter is None:
+                continue
+            taps = [t for t in self.context.tools if t.type is ToolType.TAP or "tap" in t.id.lower()]
             exact = [t for t in taps if abs(t.diameter - f.diameter) < 0.1]
             if not exact:
                 continue
             tool = exact[0]
             params = self.analyzer.analyze(tool, f, OpPurpose.TAPPING.value, self.setup)
+            # Compute tap feed per revolution from thread pitch
+            pitch = _metric_pitch.get(f.diameter, f.diameter * 0.15)
+            tap_feed_mm_per_rev = pitch
+            # Tapping requires a pre-drilled hole — declare dependency on the feature
             ops.append(PlannedOperation(
                 id=self._next_id("op_tap"), purpose=OpPurpose.TAPPING,
+                feature=f, tool=tool, params=params, depends_on=[f.id],
+                notes={"tap_feed_mm_per_rev": tap_feed_mm_per_rev}))
+        return ops
+
+    def _plan_thread_milling(self) -> list[PlannedOperation]:
+        """Plan thread milling for TAPPED_HOLE features when thread mill tools are available.
+        Thread milling is an alternative to tapping that works for large diameters
+        or when rigid tapping is not available."""
+        ops: list[PlannedOperation] = []
+        for f in self.features:
+            if f.type is not FeatureType.TAPPED_HOLE and not f.notes.get("tapped"):
+                continue
+            if f.diameter is None:
+                continue
+            # Only plan thread milling if thread mill tools are available
+            thread_mills = [t for t in self.context.tools
+                            if t.type is ToolType.THREAD_MILL or "thread" in t.id.lower()]
+            if not thread_mills:
+                continue
+            # Find a thread mill that fits the hole diameter
+            fitting = [t for t in thread_mills if t.diameter < f.diameter]
+            if not fitting:
+                continue
+            tool = min(fitting, key=lambda t: f.diameter - t.diameter)
+            params = self.analyzer.analyze(tool, f, OpPurpose.THREAD_MILLING.value, self.setup)
+            # Thread pitch from standard metric table
+            _metric_pitch = {
+                2.0: 0.4, 2.5: 0.45, 3.0: 0.5, 3.5: 0.6, 4.0: 0.7,
+                5.0: 0.8, 6.0: 1.0, 8.0: 1.25, 10.0: 1.5, 12.0: 1.75,
+                14.0: 2.0, 16.0: 2.0, 18.0: 2.5, 20.0: 2.5, 22.0: 2.5,
+                24.0: 3.0, 27.0: 3.0, 30.0: 3.5, 33.0: 3.5, 36.0: 4.0,
+            }
+            pitch = _metric_pitch.get(f.diameter, f.diameter * 0.15)
+            # Thread milling requires a pre-drilled hole
+            ops.append(PlannedOperation(
+                id=self._next_id("op_threadmill"), purpose=OpPurpose.THREAD_MILLING,
+                feature=f, tool=tool, params=params, depends_on=[f.id],
+                notes={"pitch": pitch, "thread_depth": pitch * 1.2}))
+        return ops
+
+    def _plan_grooving(self) -> list[PlannedOperation]:
+        """Plan grooving operations for features that require groove cutting.
+        Currently matches BORE/THROUGH_BORE features when groove cutters are available."""
+        ops: list[PlannedOperation] = []
+        for f in self.features:
+            # Groove features: undercuts or explicit groove annotations
+            is_groove = (f.type in (FeatureType.BORE, FeatureType.THROUGH_BORE)
+                         and f.notes.get("groove"))
+            if not is_groove:
+                continue
+            if f.diameter is None:
+                continue
+            groove_tools = [t for t in self.context.tools
+                            if t.type is ToolType.GROOVE_CUTTER or "groove" in t.id.lower()]
+            if not groove_tools:
+                continue
+            # Find a groove cutter that fits
+            fitting = [t for t in groove_tools if t.diameter <= f.diameter]
+            if not fitting:
+                continue
+            tool = max(fitting, key=lambda t: t.diameter)
+            params = self.analyzer.analyze(tool, f, OpPurpose.GROOVING.value, self.setup)
+            ops.append(PlannedOperation(
+                id=self._next_id("op_groove"), purpose=OpPurpose.GROOVING,
                 feature=f, tool=tool, params=params))
         return ops
 
@@ -344,6 +539,38 @@ class OperationPlanner:
             ops.append(PlannedOperation(
                 id=self._next_id("op_chamfer"), purpose=OpPurpose.CHAMFERING,
                 feature=f, tool=tool, params=params))
+        return ops
+
+    def _plan_countersinking(self) -> list[PlannedOperation]:
+        """Plan countersinking operations for COUNTERSINK features.
+        Prefers a dedicated COUNTERSINK_TOOL; falls back to CHAMFER_MILL.
+        The operation depends on the parent hole feature's drilling op (resolved
+        via feature ID by the topo_sort)."""
+        ops: list[PlannedOperation] = []
+        for f in self.features:
+            if f.type is not FeatureType.COUNTERSINK:
+                continue
+            if f.diameter is None:
+                continue
+            # Prefer dedicated countersink tool, fall back to chamfer mill
+            csink_tools = [t for t in self.context.tools
+                           if t.type is ToolType.COUNTERSINK_TOOL]
+            chamfer_tools = [t for t in self.context.tools
+                             if t.type is ToolType.CHAMFER_MILL]
+            pool = csink_tools or chamfer_tools
+            if not pool:
+                continue  # no suitable tool — skip this feature
+            # Pick the smallest tool whose diameter covers the countersink major diameter
+            fitting = [t for t in pool if t.diameter >= f.diameter - 0.1]
+            tool = min(fitting, key=lambda t: t.diameter) if fitting else min(pool, key=lambda t: t.diameter)
+            params = self.analyzer.analyze(tool, f, OpPurpose.COUNTERSINKING.value, self.setup)
+            # Countersinking must follow drilling of the parent hole
+            deps = [f.parent_feature_id] if f.parent_feature_id else []
+            semi_angle_deg = f.notes.get("semi_angle_deg", 45.0)
+            ops.append(PlannedOperation(
+                id=self._next_id("op_csink"), purpose=OpPurpose.COUNTERSINKING,
+                feature=f, tool=tool, params=params, depends_on=deps,
+                notes={"countersink_angle_deg": 90.0 - float(semi_angle_deg)}))
         return ops
 
 

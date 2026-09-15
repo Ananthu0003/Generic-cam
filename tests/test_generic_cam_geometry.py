@@ -309,9 +309,13 @@ def test_missing_compatible_tool_fails():
     )
 
     planner = OperationPlanner(ctx, setup, features)
-    with pytest.raises(CamError) as exc_info:
-        planner.plan()
-    assert exc_info.value.code == UNSUPPORTED_FEATURE
+    ops = planner.plan()
+    # Planner does not invent tools for the 1.0mm hole; it logs a structured MISSING_TOOL warning
+    assert len(planner.warnings) >= 1
+    assert any(w["code"] == "MISSING_TOOL" for w in planner.warnings)
+    # The 1.0mm hole was NOT assigned an oversized 12mm or 8mm tool
+    assert not any(op.tool.diameter > 1.0 and op.feature.diameter == 1.0 for op in ops)
+
 
 
 # =============================================================================
@@ -337,11 +341,12 @@ def test_sample_bracket_pipeline():
     assert len(facing_feats) == 1, f"Expected exactly 1 facing feature, got {len(facing_feats)}"
     assert np.isclose(facing_feats[0].depth, 1.0, atol=0.2)
 
-    # 2. Operations: Facing + Drilling/Boring
-    assert len(res.operations) == 2
+    # 2. Operations: Facing + Drilling/Boring + Outer Contour Finishing
+    assert len(res.operations) == 3
     op_purposes = [o.purpose for o in res.operations]
     assert OpPurpose.FACING in op_purposes
     assert OpPurpose.DRILLING in op_purposes
+    assert OpPurpose.FINISHING in op_purposes
 
     # 3. G-code: Valid and non-empty
     assert len(res.gcode.splitlines()) > 20

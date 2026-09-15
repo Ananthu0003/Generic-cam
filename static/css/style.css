@@ -688,7 +688,125 @@ body {
 .text-amber { color: var(--accent-amber); }
 .text-purple { color: var(--accent-purple); }
 .w-100 { width: 100%; }
+.mb-2 { margin-bottom: 0.5rem; }
 .mb-3 { margin-bottom: 0.75rem; }
+.mt-2 { margin-top: 0.5rem; }
+
+.btn-xs {
+  padding: 4px 8px;
+  font-size: 0.72rem;
+  border-radius: var(--radius-sm);
+}
+
+.btn-sm {
+  padding: 6px 10px;
+  font-size: 0.78rem;
+  border-radius: var(--radius-sm);
+}
+
+.button-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.button-row .btn {
+  flex: 1;
+  min-width: 70px;
+  text-align: center;
+  justify-content: center;
+}
+
+.card-header-flex {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.card-subtitle {
+  font-size: 0.74rem;
+  color: var(--text-dim);
+  margin-bottom: 10px;
+  line-height: 1.3;
+}
+
+/* Multi-Setup Tabs */
+.setup-tabs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.setup-tab-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: var(--transition-fast);
+}
+
+.setup-tab-item:hover {
+  background: var(--bg-card-hover);
+  border-color: rgba(255, 255, 255, 0.15);
+}
+
+.setup-tab-item.active {
+  border-color: var(--accent-cyan);
+  background: rgba(0, 240, 255, 0.08);
+}
+
+.setup-tab-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.setup-badge {
+  font-size: 0.68rem;
+  font-family: var(--font-mono);
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(0, 240, 255, 0.15);
+  color: var(--accent-cyan);
+}
+
+.setup-badge.g55 {
+  background: rgba(139, 92, 246, 0.18);
+  color: var(--accent-purple);
+}
+
+.setup-badge.g56 {
+  background: rgba(245, 158, 11, 0.18);
+  color: var(--accent-amber);
+}
+
+.setup-tab-title {
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.setup-tab-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.btn-icon-del {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 2px;
+}
+
+.btn-icon-del:hover {
+  color: var(--accent-red);
+}
 
 /* Custom Scrollbars */
 ::-webkit-scrollbar {

@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import tempfile
+import uuid
+import time
 from pathlib import Path
 from typing import Optional
 import numpy as np
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Request
 
 from ..context import (
     PlanningContext,
     Setup,
     Stock,
     StockKind,
+    Fixture,
     Material,
     DEFAULT_MATERIALS,
     Tool,
@@ -31,11 +34,13 @@ from ..machinability import CuttingParameters
 from ..toolpaths.strategies import StrategyEngine, StrategyContext
 from ..toolpaths.semantic import Toolpath, MotionSegment, MotionType
 from ..geometry.step_import import import_step, ImportedModel
+from ..geometry.topology import Shape
 from ..geometry.mesh import TriangleMesh
 from ..geometry.voxel import VoxelStock
 from ..post import get_post_processor
 from ..errors import CamError
 from ..demo_models import (
+    create_prismatic_bracket_shape,
     create_prismatic_bracket_mesh,
     get_default_tools,
     get_default_machine,
@@ -48,8 +53,14 @@ from .models import (
     FeatureItem,
     RecognizeFeaturesResponse,
     ToolItem,
+    AddToolRequest,
+    AutoSuggestToolRequest,
     MachineItem,
     StockConfig,
+    OrientModelRequest,
+    SetupItem,
+    AddSetupRequest,
+    SetupsListResponse,
     PlanOpsRequest,
     PlannedOpItem,
     PlanOpsResponse,
@@ -61,7 +72,72 @@ from .models import (
     PostProcessResponse,
 )
 
+
 router = APIRouter(prefix="/api", tags=["cam"])
+
+
+def _euler_to_matrix(rx_deg: float, ry_deg: float, rz_deg: float) -> np.ndarray:
+    rx, ry, rz = np.radians(rx_deg), np.radians(ry_deg), np.radians(rz_deg)
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]], dtype=float)
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], dtype=float)
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]], dtype=float)
+    R = Rz @ Ry @ Rx
+    T = np.eye(4, dtype=float)
+    T[:3, :3] = R
+    return T
+
+
+def _shape_to_demo_cad_model(name: str, shape: Shape, desc: str = "Imported Model") -> DemoCADModel:
+    vertices = []
+    normals_list = []
+    indices = []
+    faces_meta = []
+    shape_faces = shape.faces()
+    for f in shape_faces:
+        if not len(f.triangles):
+            continue
+        base_idx = len(vertices) // 3
+        tris = f.triangles
+        n_tris = len(tris)
+        for t in tris:
+            for p in t:
+                vertices.extend([float(p[0]), float(p[1]), float(p[2])])
+                norm = f.oriented_normal
+                normals_list.extend([float(norm[0]), float(norm[1]), float(norm[2])])
+        for i in range(n_tris * 3):
+            indices.append(base_idx + i)
+        faces_meta.append({
+            "id": f.index,
+            "kind": f.surface.kind.value,
+            "area": float(f.area),
+        })
+    bmin, bmax = shape.bounding_box()
+    return DemoCADModel(
+        name=name,
+        description=desc,
+        bounds_min=[float(x) for x in bmin],
+        bounds_max=[float(x) for x in bmax],
+        vertices=vertices,
+        normals=normals_list,
+        indices=indices,
+        faces_metadata=faces_meta,
+    )
+
+
+class SetupConfig:
+    def __init__(self, id: str, name: str, work_offset: str = "G54",
+                 rotation_deg: Optional[list[float]] = None,
+                 stock_cfg: Optional[StockConfig] = None):
+        self.id = id
+        self.name = name
+        self.work_offset = work_offset
+        self.rotation_deg = rotation_deg or [0.0, 0.0, 0.0]
+        self.stock_cfg = stock_cfg or StockConfig(work_offset=work_offset)
+        self.feature_ids: list[str] = []
+        self.operations_count: int = 0
 
 
 class SessionState:
@@ -78,18 +154,52 @@ class SessionState:
         self.planned_ops: list[PlannedOperation] = []
         self.toolpaths: list[Toolpath] = []
         self.stock_config = StockConfig()
+        self.setups: list[SetupConfig] = [
+            SetupConfig(id="setup_001", name="Setup 1 - Top Milling", work_offset="G54", rotation_deg=[0.0, 0.0, 0.0]),
+        ]
+        self.active_setup_id: str = "setup_001"
         self.load_demo()
 
     def load_demo(self):
-        self.raw_mesh = create_prismatic_bracket_mesh()
-        self.model_name = self.raw_mesh.name
-        self.imported_model = None
+        try:
+            self.imported_model = create_prismatic_bracket_shape()
+            self.model_name = "Prismatic CAM Test Bracket"
+            self.raw_mesh = _shape_to_demo_cad_model(self.model_name, self.imported_model.shape, "Standard 100x60x25mm aerospace bracket with top facing, 40x30mm pocket, Ø12mm bore, and 8mm stepdown.")
+        except Exception:
+            self.raw_mesh = create_prismatic_bracket_mesh()
+            self.model_name = self.raw_mesh.name
+            self.imported_model = None
         self.features = []
         self.planned_ops = []
         self.toolpaths = []
+        self.setups = [
+            SetupConfig(id="setup_001", name="Setup 1 - Top Milling", work_offset="G54", rotation_deg=[0.0, 0.0, 0.0]),
+        ]
+        self.active_setup_id = "setup_001"
 
 
-session = SessionState()
+_sessions: dict[str, tuple[SessionState, float]] = {}
+_default_session = SessionState()
+_SESSION_TTL_SECONDS = 3600  # 1 hour
+
+
+def _evict_expired_sessions():
+    now = time.time()
+    expired = [sid for sid, (_, ts) in _sessions.items() if now - ts > _SESSION_TTL_SECONDS]
+    for sid in expired:
+        del _sessions[sid]
+
+
+def _get_session(request: Request) -> SessionState:
+    _evict_expired_sessions()
+    sid = request.headers.get("X-Session-ID", "")
+    if not sid:
+        return _default_session
+    if sid not in _sessions:
+        _sessions[sid] = (SessionState(), time.time())
+    state, _ = _sessions[sid]
+    _sessions[sid] = (state, time.time())
+    return state
 
 
 def _mesh_to_response(demo: DemoCADModel) -> MeshData:
@@ -107,32 +217,35 @@ def _mesh_to_response(demo: DemoCADModel) -> MeshData:
 
 
 @router.get("/model/demo", response_model=ModelInfoResponse)
-def get_demo_model():
+def get_demo_model(request: Request):
     """Loads and returns the demo CAD model mesh and bounding box."""
-    session.load_demo()
+    sess = _get_session(request)
+    sess.load_demo()
     return ModelInfoResponse(
-        name=session.model_name,
+        name=sess.model_name,
         units="mm",
-        mesh=_mesh_to_response(session.raw_mesh),
+        mesh=_mesh_to_response(sess.raw_mesh),
         features_count=0,
     )
 
 
 @router.post("/model/upload", response_model=ModelInfoResponse)
-async def upload_model_file(file: UploadFile = File(...)):
+async def upload_model_file(request: Request, file: UploadFile = File(...)):
     """Uploads a CAD file (.step, .stp, .stl), processes it, and caches the model."""
-    filename = file.filename.lower()
-    if not (filename.endswith(".step") or filename.endswith(".stp") or filename.endswith(".stl")):
+    sess = _get_session(request)
+    orig_filename = file.filename or "Uploaded Part"
+    filename_lower = orig_filename.lower()
+    if not (filename_lower.endswith(".step") or filename_lower.endswith(".stp") or filename_lower.endswith(".stl")):
         raise HTTPException(status_code=400, detail="Supported formats: .step, .stp, .stl")
 
-    suffix = Path(file.filename).suffix
+    suffix = Path(orig_filename).suffix if Path(orig_filename).suffix else ".step"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         content = await file.read()
         tmp.write(content)
         tmp_path = Path(tmp.name)
 
     try:
-        if filename.endswith(".stl"):
+        if filename_lower.endswith(".stl"):
             from ..geometry.stl_import import import_stl, STLImportError
             try:
                 mesh = import_stl(tmp_path)
@@ -164,8 +277,8 @@ async def upload_model_file(file: UploadFile = File(...)):
             bmin = [float(x) for x in mesh.bounds_min]
             bmax = [float(x) for x in mesh.bounds_max]
 
-            session.raw_mesh = DemoCADModel(
-                name=file.filename,
+            sess.raw_mesh = DemoCADModel(
+                name=orig_filename,
                 description="Imported STL Mesh",
                 bounds_min=bmin,
                 bounds_max=bmax,
@@ -174,82 +287,169 @@ async def upload_model_file(file: UploadFile = File(...)):
                 indices=indices,
                 faces_metadata=faces_meta,
             )
-            session.imported_model = None
-            session.model_name = file.filename
-            session.features = []
-            session.planned_ops = []
-            session.toolpaths = []
+            sess.imported_model = None
+            sess.model_name = orig_filename
+            sess.features = []
+            sess.planned_ops = []
+            sess.toolpaths = []
 
             return ModelInfoResponse(
-                name=session.model_name,
+                name=sess.model_name,
                 units="mm",
-                mesh=_mesh_to_response(session.raw_mesh),
+                mesh=_mesh_to_response(sess.raw_mesh),
                 features_count=0,
             )
         else:
             imported = import_step(tmp_path)
-            session.imported_model = imported
-            session.model_name = file.filename
-            session.features = []
-            session.planned_ops = []
-            session.toolpaths = []
-
-            vertices = []
-            normals_list = []
-            indices = []
-            faces_meta = []
-
-            shape_faces = imported.shape.faces()
-            for f in shape_faces:
-                if not len(f.triangles):
-                    continue
-                base_idx = len(vertices) // 3
-                tris = f.triangles
-                n_tris = len(tris)
-                for t in tris:
-                    for p in t:
-                        vertices.extend([float(p[0]), float(p[1]), float(p[2])])
-                        norm = f.oriented_normal
-                        normals_list.extend([float(norm[0]), float(norm[1]), float(norm[2])])
-                for i in range(n_tris * 3):
-                    indices.append(base_idx + i)
-
-                faces_meta.append({
-                    "id": f.index,
-                    "kind": f.surface.kind.value,
-                    "area": float(f.area),
-                })
-
-            bmin = [float(x) for x in imported.original_bounds[0]]
-            bmax = [float(x) for x in imported.original_bounds[1]]
-
-            session.raw_mesh = DemoCADModel(
-                name=file.filename,
-                description="Imported STEP Model",
-                bounds_min=bmin,
-                bounds_max=bmax,
-                vertices=vertices,
-                normals=normals_list,
-                indices=indices,
-                faces_metadata=faces_meta,
-            )
+            sess.imported_model = imported
+            sess.model_name = orig_filename
+            sess.features = []
+            sess.planned_ops = []
+            sess.toolpaths = []
+            sess.raw_mesh = _shape_to_demo_cad_model(orig_filename, imported.shape, "Imported STEP Model")
 
             return ModelInfoResponse(
-                name=session.model_name,
+                name=sess.model_name,
                 units="mm",
-                mesh=_mesh_to_response(session.raw_mesh),
+                mesh=_mesh_to_response(sess.raw_mesh),
                 features_count=0,
             )
+    except CamError as e:
+        raise HTTPException(status_code=422, detail=f"{e.code}: {e.message}")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Failed to process file: {str(e)}")
     finally:
         if tmp_path.exists():
-            tmp_path.unlink()
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+
+
+@router.post("/model/orient", response_model=ModelInfoResponse)
+def orient_model(request: Request, req: OrientModelRequest):
+    """Interactively rotates the active CAD model around X, Y, or Z axis or aligns a selected face to +Z."""
+    sess = _get_session(request)
+    if sess.imported_model is not None:
+        if req.align_face_id is not None:
+            sess.imported_model.shape = sess.imported_model.shape.align_face_to_axis(req.align_face_id, np.array([0.0, 0.0, 1.0]))
+        else:
+            sess.imported_model.shape = sess.imported_model.shape.rotate(req.axis, req.angle_deg)
+        bmin, bmax = sess.imported_model.shape.bounding_box()
+        sess.imported_model.original_bounds = (bmin, bmax)
+        sess.raw_mesh = _shape_to_demo_cad_model(sess.model_name, sess.imported_model.shape, "Oriented Model")
+    elif sess.raw_mesh is not None:
+        # Mesh rotation fallback
+        pts = np.array(sess.raw_mesh.vertices).reshape(-1, 3)
+        norms = np.array(sess.raw_mesh.normals).reshape(-1, 3)
+        rad = np.radians(req.angle_deg)
+        c, s = np.cos(rad), np.sin(rad)
+        if req.axis.upper() == "X":
+            R = np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+        elif req.axis.upper() == "Y":
+            R = np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+        else:
+            R = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+        center = 0.5 * (np.array(sess.raw_mesh.bounds_min) + np.array(sess.raw_mesh.bounds_max))
+        rotated_pts = (pts - center) @ R.T + center
+        rotated_norms = norms @ R.T
+        bmin = [float(x) for x in rotated_pts.min(axis=0)]
+        bmax = [float(x) for x in rotated_pts.max(axis=0)]
+        sess.raw_mesh.vertices = rotated_pts.flatten().tolist()
+        sess.raw_mesh.normals = rotated_norms.flatten().tolist()
+        sess.raw_mesh.bounds_min = bmin
+        sess.raw_mesh.bounds_max = bmax
+
+    # Invalidate previous cached features/ops/toolpaths
+    sess.features = []
+    sess.planned_ops = []
+    sess.toolpaths = []
+
+    return ModelInfoResponse(
+        name=sess.model_name,
+        units="mm",
+        mesh=_mesh_to_response(sess.raw_mesh),
+        features_count=0,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Multi-Setup Management Routes
+# -----------------------------------------------------------------------------
+
+@router.get("/setups", response_model=SetupsListResponse)
+def get_setups(request: Request):
+    """List all configured machining setups."""
+    sess = _get_session(request)
+    items = []
+    for s in sess.setups:
+        items.append(SetupItem(
+            id=s.id,
+            name=s.name,
+            work_offset=s.work_offset,
+            rotation_deg=s.rotation_deg,
+            stock=s.stock_cfg,
+            feature_ids=s.feature_ids,
+            operations_count=s.operations_count,
+            is_active=(s.id == sess.active_setup_id),
+        ))
+    return SetupsListResponse(setups=items, active_setup_id=sess.active_setup_id)
+
+
+@router.post("/setups/add", response_model=SetupsListResponse)
+def add_setup(request: Request, req: AddSetupRequest):
+    """Add a new setup (e.g. OP20 Flip 180°, Side 90°, etc.)."""
+    sess = _get_session(request)
+    idx = len(sess.setups) + 1
+    new_id = f"setup_{idx:03d}"
+
+    rotation = req.rotation_deg or [0.0, 0.0, 0.0]
+    if req.preset == "flip_x_180":
+        rotation = [180.0, 0.0, 0.0]
+    elif req.preset == "flip_y_180":
+        rotation = [0.0, 180.0, 0.0]
+    elif req.preset == "side_x_90":
+        rotation = [90.0, 0.0, 0.0]
+    elif req.preset == "side_y_90":
+        rotation = [0.0, 90.0, 0.0]
+
+    stk = req.stock or StockConfig(work_offset=req.work_offset)
+    setup = SetupConfig(id=new_id, name=req.name, work_offset=req.work_offset, rotation_deg=rotation, stock_cfg=stk)
+    sess.setups.append(setup)
+    sess.active_setup_id = new_id
+
+    return get_setups(request)
+
+
+@router.post("/setups/active/{setup_id}", response_model=SetupsListResponse)
+def set_active_setup(request: Request, setup_id: str):
+    """Sets the active setup."""
+    sess = _get_session(request)
+    found = any(s.id == setup_id for s in sess.setups)
+    if not found:
+        raise HTTPException(status_code=404, detail=f"Setup {setup_id} not found")
+    sess.active_setup_id = setup_id
+    return get_setups(request)
+
+
+@router.delete("/setups/{setup_id}", response_model=SetupsListResponse)
+def delete_setup(request: Request, setup_id: str):
+    """Deletes a setup if more than 1 exist."""
+    sess = _get_session(request)
+    if len(sess.setups) <= 1:
+        raise HTTPException(status_code=400, detail="Cannot delete the primary setup")
+    sess.setups = [s for s in sess.setups if s.id != setup_id]
+    if sess.active_setup_id == setup_id:
+        sess.active_setup_id = sess.setups[0].id
+    return get_setups(request)
 
 
 @router.get("/tools-and-machines")
-def get_tools_and_machines():
+def get_tools_and_machines(request: Request):
     """Returns available tools catalog and default machine configuration."""
+    sess = _get_session(request)
     tool_items = [
         ToolItem(
             id=t.id,
@@ -264,10 +464,10 @@ def get_tools_and_machines():
             max_rpm=12000.0,
             max_feed=3000.0,
         )
-        for t in session.tools
+        for t in sess.tools
     ]
 
-    machine = session.machine
+    machine = sess.machine
     machine_item = MachineItem(
         id=machine.id,
         name=machine.name,
@@ -289,32 +489,127 @@ def get_tools_and_machines():
     return {"tools": tool_items, "machine": machine_item}
 
 
+@router.post("/tools/add")
+def add_custom_tool(request: Request, req: AddToolRequest):
+    """Add a new custom tool to the active session tool library."""
+    sess = _get_session(request)
+    t_num = req.tool_number
+    if t_num is None:
+        used_numbers = [t.tool_number for t in sess.tools]
+        t_num = max(used_numbers, default=0) + 1
+
+    type_map = {
+        "drill": ToolType.DRILL,
+        "flat_endmill": ToolType.FLAT_ENDMILL,
+        "ball_endmill": ToolType.BALL_ENDMILL,
+        "bullnose_endmill": ToolType.BULLNOSE_ENDMILL,
+        "face_mill": ToolType.FACE_MILL,
+        "chamfer_mill": ToolType.CHAMFER_MILL,
+        "countersink_tool": ToolType.COUNTERSINK_TOOL,
+        "boring_bar": ToolType.BORING_BAR,
+        "reamer": ToolType.REAMER,
+        "tap": ToolType.TAP,
+        "thread_mill": ToolType.THREAD_MILL,
+        "groove_cutter": ToolType.GROOVE_CUTTER,
+    }
+    ttype = type_map.get(req.tool_type.lower(), ToolType.FLAT_ENDMILL)
+    t_id = f"T{t_num:02d}"
+    existing_ids = {t.id for t in sess.tools}
+    if t_id in existing_ids:
+        t_id = f"T{t_num:02d}_{len(sess.tools)+1}"
+
+    new_tool = Tool(
+        id=t_id,
+        tool_number=t_num,
+        type=ttype,
+        diameter=float(req.diameter),
+        corner_radius=float(req.corner_radius),
+        flute_length=float(req.flute_length),
+        overall_length=float(req.overall_length),
+        flutes=int(req.flutes),
+        material=req.material,
+        can_plunge=True,
+    )
+    sess.tools.append(new_tool)
+    return get_tools_and_machines(request)
+
+
+@router.delete("/tools/{tool_id}")
+def delete_custom_tool(request: Request, tool_id: str):
+    """Remove a tool from the session tool library."""
+    sess = _get_session(request)
+    sess.tools = [t for t in sess.tools if t.id != tool_id]
+    return get_tools_and_machines(request)
+
+
+@router.post("/tools/auto-suggest")
+def auto_suggest_tool(request: Request, req: AutoSuggestToolRequest):
+    """Auto-generate a fitting tool for an unmachined feature and add it to library."""
+    sess = _get_session(request)
+    feature = next((f for f in sess.features if f.id == req.feature_id), None)
+    dia = req.diameter or (feature.diameter if feature else 1.0) or 1.0
+    ttype = req.tool_type or ("drill" if feature and feature.type in (FeatureType.HOLE, FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE, FeatureType.COUNTERBORE) else "flat_endmill")
+    
+    depth = feature.depth if (feature and feature.depth) else 5.0
+    add_req = AddToolRequest(
+        tool_type=ttype,
+        diameter=round(float(dia), 2),
+        flute_length=round(max(depth * 1.3, 5.0), 1),
+        overall_length=round(max(depth * 2.5, 35.0), 1),
+        flutes=2,
+        material="carbide"
+    )
+    return add_custom_tool(request, add_req)
+
+
+
 @router.post("/recognize-features", response_model=RecognizeFeaturesResponse)
-def recognize_features():
-    """Runs geometric feature recognition on the active part."""
-    if session.imported_model is not None:
-        bmin, bmax = session.imported_model.original_bounds
-        stock_top = float(bmax[2]) + session.stock_config.margin_z_top
-        rec = FeatureRecognizer(session.imported_model.shape, stock_top_z=stock_top)
-        session.features = rec.recognize()
+def recognize_features(request: Request):
+    """Runs geometric feature recognition on the active part across all setups."""
+    sess = _get_session(request)
+    all_features: list[MachiningFeature] = []
+
+    if sess.imported_model is not None:
+        for s in sess.setups:
+            rot_mat = _euler_to_matrix(*s.rotation_deg)
+            setup_shape = sess.imported_model.shape.transformed(rot_mat)
+            bmin, bmax = setup_shape.bounding_box()
+            stock_top = float(bmax[2]) + s.stock_cfg.margin_z_top
+            rec = FeatureRecognizer(setup_shape, stock_top_z=stock_top)
+            feats = rec.recognize()
+            for f in feats:
+                f.id = f"{s.id}_{f.id}"
+                f.notes["setup_id"] = s.id
+                f.notes["setup_name"] = s.name
+            s.feature_ids = [f.id for f in feats]
+            all_features.extend(feats)
+        sess.features = all_features
     else:
         # Fallback demo model features
-        session.features = [
+        s0 = sess.setups[0]
+        margin_z = float(sess.stock_config.margin_z_top) if hasattr(sess.stock_config, 'margin_z_top') else 1.0
+        sess.features = [
             MachiningFeature(
-                id="feat_facing_001",
+                id=f"{s0.id}_feat_facing_001",
                 type=FeatureType.FACING_REGION,
                 face_indices=[5],
                 bounds_min=np.array([0.0, 0.0, 25.0]),
-                bounds_max=np.array([100.0, 60.0, 25.0]),
-                depth=session.stock_config.margin_z_top,
-                top_z=25.0 + session.stock_config.margin_z_top,
+                bounds_max=np.array([100.0, 60.0, 25.0 + margin_z]),
+                depth=margin_z,
+                top_z=25.0 + margin_z,
                 floor_z=25.0,
                 accessibility=Accessibility.TOOL_AXIS_OK,
                 is_concave=False,
-                notes={"strategy": "zigzag", "stock_removal": f"{session.stock_config.margin_z_top}mm"},
+                notes={
+                    "strategy": "zigzag",
+                    "stock_removal": f"{margin_z:.1f}mm",
+                    "excess_height": margin_z,
+                    "setup_id": s0.id,
+                    "setup_name": s0.name,
+                },
             ),
             MachiningFeature(
-                id="feat_pocket_001",
+                id=f"{s0.id}_feat_pocket_001",
                 type=FeatureType.POCKET,
                 face_indices=[8, 9],
                 bounds_min=np.array([15.0, 15.0, 15.0]),
@@ -324,10 +619,10 @@ def recognize_features():
                 floor_z=15.0,
                 accessibility=Accessibility.TOOL_AXIS_OK,
                 is_concave=True,
-                notes={"width": 40.0, "length": 30.0, "corner_radius": 3.0},
+                notes={"width": 40.0, "length": 30.0, "corner_radius": 3.0, "setup_id": s0.id, "setup_name": s0.name},
             ),
             MachiningFeature(
-                id="feat_step_001",
+                id=f"{s0.id}_feat_step_001",
                 type=FeatureType.STEP,
                 face_indices=[6, 7],
                 bounds_min=np.array([80.0, 0.0, 17.0]),
@@ -337,10 +632,10 @@ def recognize_features():
                 floor_z=17.0,
                 accessibility=Accessibility.TOOL_AXIS_OK,
                 is_concave=False,
-                notes={"open_sides": ["+X", "-Y", "+Y"]},
+                notes={"open_sides": ["+X", "-Y", "+Y"], "setup_id": s0.id, "setup_name": s0.name},
             ),
             MachiningFeature(
-                id="feat_hole_001",
+                id=f"{s0.id}_feat_hole_001",
                 type=FeatureType.THROUGH_HOLE,
                 face_indices=[10],
                 bounds_min=np.array([64.0, 24.0, 0.0]),
@@ -351,9 +646,23 @@ def recognize_features():
                 diameter=12.0,
                 accessibility=Accessibility.TOOL_AXIS_OK,
                 is_concave=True,
-                notes={"center": [70.0, 30.0], "type": "through_bore"},
+                notes={"center": [70.0, 30.0], "type": "through_bore", "setup_id": s0.id, "setup_name": s0.name},
+            ),
+            MachiningFeature(
+                id=f"{s0.id}_feat_contour_001",
+                type=FeatureType.CONTOUR,
+                face_indices=[1, 2, 3, 4],
+                bounds_min=np.array([0.0, 0.0, 0.0]),
+                bounds_max=np.array([100.0, 60.0, 25.0]),
+                depth=25.0,
+                top_z=25.0,
+                floor_z=0.0,
+                accessibility=Accessibility.TOOL_AXIS_OK,
+                is_concave=False,
+                notes={"closed": True, "type": "outer_profile", "setup_id": s0.id, "setup_name": s0.name},
             ),
         ]
+        s0.feature_ids = [f.id for f in sess.features]
 
     resp_items = [
         FeatureItem(
@@ -371,7 +680,7 @@ def recognize_features():
             face_indices=f.face_indices,
             notes=f.notes,
         )
-        for f in session.features
+        for f in sess.features
     ]
 
     return RecognizeFeaturesResponse(features=resp_items, count=len(resp_items))
@@ -381,50 +690,143 @@ def _tool_name(t: Tool) -> str:
     return f"{t.id} ({t.type.value.replace('_', ' ').title()} Ø{t.diameter}mm)"
 
 
-def _build_context_and_setup(stock_cfg: StockConfig):
-    bmin = session.raw_mesh.bounds_min if session.raw_mesh else [0, 0, 0]
-    bmax = session.raw_mesh.bounds_max if session.raw_mesh else [100, 60, 25]
-    stock_min = np.array([bmin[0] - stock_cfg.margin_x, bmin[1] - stock_cfg.margin_y, bmin[2] - stock_cfg.margin_z_bottom])
-    stock_max = np.array([bmax[0] + stock_cfg.margin_x, bmax[1] + stock_cfg.margin_y, bmax[2] + stock_cfg.margin_z_top])
-    stock = Stock(kind=StockKind.BOX, bounds_min=stock_min, bounds_max=stock_max)
+def _build_context_and_setups(sess: SessionState, stock_cfg: StockConfig):
+    imported = sess.imported_model or _make_dummy_imported(sess)
+    material = DEFAULT_MATERIALS.get(stock_cfg.material, DEFAULT_MATERIALS["aluminum_6061"])
 
-    setup = Setup(
-        id="setup_001",
-        name="Setup 1 - Top Milling",
-        model_to_setup=np.eye(4),
-        work_offset=WorkOffset.G54,
-        stock=stock,
-    )
+    wo_map = {
+        "G54": WorkOffset.G54, "G55": WorkOffset.G55, "G56": WorkOffset.G56,
+        "G57": WorkOffset.G57, "G58": WorkOffset.G58, "G59": WorkOffset.G59,
+    }
 
-    imported = session.imported_model or _make_dummy_imported()
+    setups_list: list[Setup] = []
+    for sc in sess.setups:
+        rot_mat = _euler_to_matrix(*sc.rotation_deg)
+        if sess.imported_model:
+            shape_in_setup = sess.imported_model.shape.transformed(rot_mat)
+            bmin, bmax = shape_in_setup.bounding_box()
+        else:
+            bmin = sess.raw_mesh.bounds_min if sess.raw_mesh else [0, 0, 0]
+            bmax = sess.raw_mesh.bounds_max if sess.raw_mesh else [100, 60, 25]
+
+        cfg = sc.stock_cfg
+        off_x = getattr(cfg, "offset_x", 0.0) or 0.0
+        off_y = getattr(cfg, "offset_y", 0.0) or 0.0
+        off_z = getattr(cfg, "offset_z", 0.0) or 0.0
+        stock_min = np.array([
+            bmin[0] - cfg.margin_x + off_x,
+            bmin[1] - cfg.margin_y + off_y,
+            bmin[2] - cfg.margin_z_bottom + off_z,
+        ])
+        stock_max = np.array([
+            bmax[0] + cfg.margin_x + off_x,
+            bmax[1] + cfg.margin_y + off_y,
+            bmax[2] + cfg.margin_z_top + off_z,
+        ])
+        stock = Stock(kind=StockKind.BOX, bounds_min=stock_min, bounds_max=stock_max)
+
+        # Clamping / Fixture setup modeling
+        fixtures: list[Fixture] = []
+        clamp_type = getattr(cfg, "clamp_type", "vise_jaws") or "vise_jaws"
+        clamp_h = float(getattr(cfg, "clamp_height", cfg.margin_z_bottom) or cfg.margin_z_bottom or 3.0)
+        clamp_w = float(getattr(cfg, "clamp_width", 12.0) or 12.0)
+
+        if clamp_type == "vise_jaws" and clamp_h > 0:
+            z_bot = float(stock_min[2])
+            z_top = z_bot + clamp_h
+            # Front Jaw (-Y)
+            jaw_front = Fixture(
+                id=f"{sc.id}_vise_jaw_front",
+                name="Front Vise Jaw",
+                bounds_min=np.array([stock_min[0] - 5.0, stock_min[1] - clamp_w, z_bot - 10.0]),
+                bounds_max=np.array([stock_max[0] + 5.0, stock_min[1], z_top]),
+                kind="vise_jaw",
+            )
+            # Rear Jaw (+Y)
+            jaw_rear = Fixture(
+                id=f"{sc.id}_vise_jaw_rear",
+                name="Rear Vise Jaw",
+                bounds_min=np.array([stock_min[0] - 5.0, stock_max[1], z_bot - 10.0]),
+                bounds_max=np.array([stock_max[0] + 5.0, stock_max[1] + clamp_w, z_top]),
+                kind="vise_jaw",
+            )
+            fixtures.extend([jaw_front, jaw_rear])
+        elif clamp_type == "toe_clamps" and clamp_h > 0:
+            z_bot = float(stock_min[2])
+            z_top = z_bot + clamp_h
+            fixtures.extend([
+                Fixture(id=f"{sc.id}_toe_1", name="Toe Clamp 1",
+                        bounds_min=np.array([stock_min[0] - 10, stock_min[1] - 10, z_bot]),
+                        bounds_max=np.array([stock_min[0] + 5, stock_min[1] + 5, z_top]), kind="toe_clamp"),
+                Fixture(id=f"{sc.id}_toe_2", name="Toe Clamp 2",
+                        bounds_min=np.array([stock_max[0] - 5, stock_min[1] - 10, z_bot]),
+                        bounds_max=np.array([stock_max[0] + 10, stock_min[1] + 5, z_top]), kind="toe_clamp"),
+                Fixture(id=f"{sc.id}_toe_3", name="Toe Clamp 3",
+                        bounds_min=np.array([stock_min[0] - 10, stock_max[1] - 5, z_bot]),
+                        bounds_max=np.array([stock_min[0] + 5, stock_max[1] + 10, z_top]), kind="toe_clamp"),
+                Fixture(id=f"{sc.id}_toe_4", name="Toe Clamp 4",
+                        bounds_min=np.array([stock_max[0] - 5, stock_max[1] - 5, z_bot]),
+                        bounds_max=np.array([stock_max[0] + 10, stock_max[1] + 10, z_top]), kind="toe_clamp"),
+            ])
+
+        wo = wo_map.get(sc.work_offset, WorkOffset.G54)
+        setup = Setup(
+            id=sc.id,
+            name=sc.name,
+            model_to_setup=rot_mat,
+            work_offset=wo,
+            stock=stock,
+            fixtures=fixtures,
+        )
+        setups_list.append(setup)
+
     ctx = PlanningContext(
         model=imported,
-        setups=[setup],
-        machine=session.machine,
-        tools=session.tools,
-        material=DEFAULT_MATERIALS.get("aluminum_6061", DEFAULT_MATERIALS["aluminum_6061"]),
+        setups=setups_list,
+        machine=sess.machine,
+        tools=sess.tools,
+        material=material,
     )
-    return ctx, setup
+    return ctx, setups_list
 
 
 @router.post("/plan-operations", response_model=PlanOpsResponse)
-def plan_operations(req: PlanOpsRequest):
-    """Plans ordered machining operations based on recognized features and tooling."""
-    session.stock_config = req.stock
+def plan_operations(request: Request, req: PlanOpsRequest):
+    """Plans ordered machining operations based on recognized features and tooling across setups."""
+    sess = _get_session(request)
+    sess.stock_config = req.stock
 
-    if not session.features:
-        recognize_features()
+    if not sess.features:
+        recognize_features(request)
 
     try:
-        ctx, setup = _build_context_and_setup(req.stock)
-        selected_features = [
-            f for f in session.features
-            if not req.selected_features or f.id in req.selected_features
-        ]
+        ctx, setups = _build_context_and_setups(sess, req.stock)
+        all_ops: list[PlannedOperation] = []
 
-        planner = OperationPlanner(ctx, setup, selected_features)
-        ops = planner.plan()
-        session.planned_ops = ops
+        all_warnings: list[dict] = []
+        all_unmachined: list[dict] = []
+
+        for s in setups:
+            setup_features = [
+                f for f in sess.features
+                if f.notes.get("setup_id", sess.setups[0].id) == s.id
+                and (not req.selected_features or f.id in req.selected_features)
+            ]
+            if setup_features:
+                planner = OperationPlanner(ctx, s, setup_features)
+                ops = planner.plan()
+                all_warnings.extend(planner.warnings)
+                all_unmachined.extend(planner.unmachined_features)
+                for op in ops:
+                    op.notes["setup_id"] = s.id
+                    op.notes["setup_name"] = s.name
+                    op.notes["work_offset"] = s.work_offset.value
+                all_ops.extend(ops)
+                for sc in sess.setups:
+                    if sc.id == s.id:
+                        sc.operations_count = len(ops)
+
+        sess.planned_ops = all_ops
 
         op_items: list[PlannedOpItem] = [
             PlannedOpItem(
@@ -437,74 +839,92 @@ def plan_operations(req: PlanOpsRequest):
                 spindle_rpm=op.params.spindle_rpm,
                 stepover_mm=op.params.stepover_mm,
                 stepdown_mm=op.params.depth_of_cut_mm,
+                setup_id=op.notes.get("setup_id"),
                 notes=op.notes,
             )
-            for op in ops
+            for op in all_ops
         ]
 
-        stock_min = [float(x) for x in setup.stock.bounds_min]
-        stock_max = [float(x) for x in setup.stock.bounds_max]
+        s0 = setups[0]
+        stock_min = [float(x) for x in s0.stock.bounds_min]
+        stock_max = [float(x) for x in s0.stock.bounds_max]
         stock_size = [stock_max[i] - stock_min[i] for i in range(3)]
 
         return PlanOpsResponse(
             operations=op_items,
             stock_bounds=BoundingBox(min=stock_min, max=stock_max, size=stock_size),
+            setup_id=sess.active_setup_id,
+            warnings=all_warnings,
+            unmachined_features=all_unmachined,
         )
+
     except CamError as e:
         raise HTTPException(status_code=400, detail=f"[{e.code}] {e.message}")
 
 
 @router.post("/generate-toolpaths", response_model=GenerateToolpathsResponse)
-def generate_toolpaths(req: GenerateToolpathsRequest):
-    """Generates continuous semantic toolpaths with rapid, cut, plunge, and retract motion segments."""
+def generate_toolpaths(request: Request, req: GenerateToolpathsRequest):
+    """Generates continuous semantic toolpaths with rapid, cut, plunge, and retract motion segments across setups."""
+    sess = _get_session(request)
     try:
-        if not session.planned_ops:
-            plan_operations(PlanOpsRequest(stock=req.stock))
+        if not sess.planned_ops:
+            plan_operations(request, PlanOpsRequest(stock=req.stock))
 
-        ctx, setup = _build_context_and_setup(req.stock)
-
-        if session.imported_model:
-            setup_shape = ctx.model_shape_in_setup(setup)
-            mesh = TriangleMesh.from_faces(setup_shape.faces())
-        else:
-            demo = session.raw_mesh or create_prismatic_bracket_mesh()
-            tri_pts = np.array(demo.vertices).reshape(-1, 3)
-            indices = np.array(demo.indices).reshape(-1, 3)
-            tris = tri_pts[indices]
-            mesh = TriangleMesh(triangles=tris)
-
-        dims = setup.stock.bounds_max - setup.stock.bounds_min
-        resolution = max(0.5, min(dims) / 50.0)
-        stock_voxels = VoxelStock.from_bounds(
-            setup.stock.bounds_min, setup.stock.bounds_max, resolution,
-        )
-        clearance_z = float(setup.stock.bounds_max[2]) + session.machine.safe_retract_height
-
-        strat_ctx = StrategyContext(
-            context=ctx,
-            setup=setup,
-            mesh=mesh,
-            stock_voxels=stock_voxels,
-            clearance_z=clearance_z,
-            finish_allowance_wall=0.3,
-            finish_allowance_floor=0.3,
-        )
-        engine = StrategyEngine(strat_ctx)
-
-        toolpaths: list[Toolpath] = []
+        ctx, setups = _build_context_and_setups(sess, req.stock)
+        all_toolpaths: list[Toolpath] = []
         total_cut_len = 0.0
         total_rapid_len = 0.0
+        prev_remaining_stock = None
 
-        for op in session.planned_ops:
-            tp = engine.generate(op)
-            toolpaths.append(tp)
-            total_cut_len += tp.cutting_length()
-            total_rapid_len += tp.rapid_length()
+        for s in setups:
+            setup_ops = [op for op in sess.planned_ops if op.notes.get("setup_id") == s.id]
+            if not setup_ops:
+                continue
 
-        session.toolpaths = toolpaths
+            if sess.imported_model:
+                setup_shape = ctx.model_shape_in_setup(s)
+                mesh = TriangleMesh.from_faces(setup_shape.faces())
+            else:
+                demo = sess.raw_mesh or create_prismatic_bracket_mesh()
+                tri_pts = np.array(demo.vertices).reshape(-1, 3)
+                indices = np.array(demo.indices).reshape(-1, 3)
+                tris = tri_pts[indices]
+                mesh = TriangleMesh(triangles=tris)
+
+            dims = s.stock.bounds_max - s.stock.bounds_min
+            resolution = max(0.5, min(dims) / 50.0)
+            if prev_remaining_stock is not None:
+                stock_voxels = prev_remaining_stock
+            else:
+                stock_voxels = VoxelStock.from_bounds(s.stock.bounds_min, s.stock.bounds_max, resolution)
+
+            clearance_z = float(s.stock.bounds_max[2]) + sess.machine.safe_retract_height
+
+            strat_ctx = StrategyContext(
+                context=ctx,
+                setup=s,
+                mesh=mesh,
+                stock_voxels=stock_voxels,
+                clearance_z=clearance_z,
+                finish_allowance_wall=0.3,
+                finish_allowance_floor=0.3,
+            )
+            engine = StrategyEngine(strat_ctx)
+
+            for op in setup_ops:
+                tp = engine.generate(op)
+                tp.metadata["setup_id"] = s.id
+                tp.metadata["work_offset"] = s.work_offset.value
+                all_toolpaths.append(tp)
+                total_cut_len += tp.cutting_length()
+                total_rapid_len += tp.rapid_length()
+
+            prev_remaining_stock = stock_voxels
+
+        sess.toolpaths = all_toolpaths
 
         resp_tps: list[ToolpathItem] = []
-        for tp in toolpaths:
+        for tp in all_toolpaths:
             seg_items = [
                 MotionSegmentItem(
                     motion_type=s.motion_type.value if hasattr(s.motion_type, "value") else str(s.motion_type),
@@ -524,6 +944,7 @@ def generate_toolpaths(req: GenerateToolpathsRequest):
                     operation_id=tp.operation_id,
                     purpose=tp.purpose,
                     tool_id=tp.tool_id,
+                    setup_id=tp.metadata.get("setup_id"),
                     segment_count=len(seg_items),
                     cutting_length_mm=tp.cutting_length(),
                     rapid_length_mm=tp.rapid_length(),
@@ -538,63 +959,109 @@ def generate_toolpaths(req: GenerateToolpathsRequest):
             total_cutting_length_mm=total_cut_len,
             total_rapid_length_mm=total_rapid_len,
             estimated_time_seconds=est_seconds,
+            setup_id=sess.active_setup_id,
         )
     except CamError as e:
         raise HTTPException(status_code=400, detail=f"[{e.code}] {e.message}")
 
 
 @router.post("/generate-gcode", response_model=PostProcessResponse)
-def generate_gcode(req: PostProcessRequest):
-    """Post-processes generated toolpaths into controller-specific CNC G-code."""
+def generate_gcode(request: Request, req: PostProcessRequest):
+    """Post-processes generated toolpaths into controller-specific CNC G-code with multi-setup support."""
+    sess = _get_session(request)
     try:
-        if not session.toolpaths:
-            generate_toolpaths(GenerateToolpathsRequest(stock=session.stock_config))
+        if not sess.toolpaths:
+            generate_toolpaths(request, GenerateToolpathsRequest(stock=sess.stock_config))
 
-        post = get_post_processor(controller=req.controller, work_offset=req.work_offset)
-        result = post.post_process(session.toolpaths, program_name=req.program_name)
+        gcode_blocks = []
+        total_time = 0.0
+        rapid_time = 0.0
+        cut_time = 0.0
+        total_rapid_dist = 0.0
+        total_cut_dist = 0.0
+        all_tools = []
+        setups_processed = []
+
+        unique_setup_ids = []
+        for tp in sess.toolpaths:
+            sid = tp.metadata.get("setup_id", "setup_001")
+            if sid not in unique_setup_ids:
+                unique_setup_ids.append(sid)
+
+        for i, sid in enumerate(unique_setup_ids):
+            setup_tps = [tp for tp in sess.toolpaths if tp.metadata.get("setup_id", "setup_001") == sid]
+            if not setup_tps:
+                continue
+
+            matching_setup = next((s for s in sess.setups if s.id == sid), None)
+            wo = matching_setup.work_offset if matching_setup else req.work_offset
+            sname = matching_setup.name if matching_setup else f"Setup {i+1}"
+            setups_processed.append(f"{sname} ({wo})")
+
+            post = get_post_processor(controller=req.controller, work_offset=wo)
+            result = post.post_process(setup_tps, program_name=f"{req.program_name}_{sid}")
+
+            if i > 0:
+                gcode_blocks.append(f"\n; ==========================================\n; (--- {sname.upper()} - FLIP / RE-FIXTURE PART ---)\n; ==========================================\nM00 (Pause for part re-fixturing / setup flip)\n")
+
+            gcode_blocks.append(result.gcode)
+            total_time += result.total_time_seconds
+            rapid_time += result.rapid_time_seconds
+            cut_time += result.cut_time_seconds
+            total_rapid_dist += result.total_rapid_dist_mm
+            total_cut_dist += result.total_cut_dist_mm
+            for t in result.tool_changes:
+                if t not in all_tools:
+                    all_tools.append(t)
+
+        combined_gcode = "\n".join(gcode_blocks)
+        line_count = len(combined_gcode.splitlines())
 
         return PostProcessResponse(
             controller=req.controller,
-            gcode=result.gcode,
-            line_count=result.line_count,
-            cycle_time_seconds=result.total_time_seconds,
-            rapid_time_seconds=result.rapid_time_seconds,
-            cut_time_seconds=result.cut_time_seconds,
-            total_rapid_dist_mm=result.total_rapid_dist_mm,
-            total_cut_dist_mm=result.total_cut_dist_mm,
-            tool_changes=result.tool_changes,
-            work_offset=result.work_offset,
+            gcode=combined_gcode,
+            line_count=line_count,
+            cycle_time_seconds=total_time,
+            rapid_time_seconds=rapid_time,
+            cut_time_seconds=cut_time,
+            total_rapid_dist_mm=total_rapid_dist,
+            total_cut_dist_mm=total_cut_dist,
+            tool_changes=all_tools,
+            work_offset=req.work_offset,
+            setups=setups_processed,
         )
     except CamError as e:
         raise HTTPException(status_code=400, detail=f"[{e.code}] {e.message}")
 
 
 @router.get("/setup-sheet")
-def get_setup_sheet():
+def get_setup_sheet(request: Request):
     """Generates a setup sheet for shop floor documentation."""
     from ..setup_sheet import generate_setup_sheet, format_setup_sheet
+    sess = _get_session(request)
 
-    if not session.raw_mesh:
+    if not sess.raw_mesh:
         raise HTTPException(status_code=400, detail="No model loaded")
 
-    if not session.planned_ops:
-        plan_operations(PlanOpsRequest(stock=session.stock_config))
+    if not sess.planned_ops:
+        plan_operations(request, PlanOpsRequest(stock=sess.stock_config))
 
-    if not session.toolpaths:
-        generate_toolpaths(GenerateToolpathsRequest(stock=session.stock_config))
+    if not sess.toolpaths:
+        generate_toolpaths(request, GenerateToolpathsRequest(stock=sess.stock_config))
 
-    ctx, setup = _build_context_and_setup(session.stock_config)
+    ctx, setups = _build_context_and_setups(sess, sess.stock_config)
+    setup = setups[0]
     post = get_post_processor(controller="grbl", work_offset="G54")
-    post_result = post.post_process(session.toolpaths, program_name="SETUP_SHEET")
+    post_result = post.post_process(sess.toolpaths, program_name="SETUP_SHEET")
 
     sheet = generate_setup_sheet(
-        program_name=session.model_name.upper().replace(" ", "_"),
-        part_name=session.model_name,
+        program_name=sess.model_name.upper().replace(" ", "_"),
+        part_name=sess.model_name,
         planning_ctx=ctx,
         setup=setup,
-        features=session.features,
-        operations=session.planned_ops,
-        toolpaths=session.toolpaths,
+        features=sess.features,
+        operations=sess.planned_ops,
+        toolpaths=sess.toolpaths,
         post_result=post_result,
     )
 
@@ -611,11 +1078,21 @@ def get_setup_sheet():
     }}
 
 
-def _make_dummy_imported():
+def _make_dummy_imported(sess: SessionState):
+    """Create a dummy ImportedModel for demo/STL models that lack B-Rep topology."""
     from ..geometry.step_import import ImportedModel
     from ..geometry.topology import Shape
+
+    from OCP.BRep import BRep_Builder
+    from OCP.TopoDS import TopoDS_Compound
+    builder = BRep_Builder()
+    compound = TopoDS_Compound()
+    builder.MakeCompound(compound)
+
+    bmin = sess.raw_mesh.bounds_min if sess.raw_mesh else [0, 0, 0]
+    bmax = sess.raw_mesh.bounds_max if sess.raw_mesh else [100, 60, 25]
     return ImportedModel(
-        shape=Shape.__new__(Shape),
+        shape=Shape(compound),
         declared_units="mm",
-        original_bounds=(np.zeros(3), np.ones(3)),
+        original_bounds=(np.array(bmin, dtype=float), np.array(bmax, dtype=float)),
     )
