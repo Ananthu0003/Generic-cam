@@ -1,4 +1,4 @@
-"""End-to-end test suite for Generic CAM post-processors, API endpoints, and web stack."""
+"""End-to-end test suite for VexCAM post-processors, API endpoints, and web stack."""
 
 import pytest
 from fastapi.testclient import TestClient
@@ -110,7 +110,7 @@ def test_api_feature_recognition_and_ops(client):
 def test_static_index(client):
     res = client.get("/")
     assert res.status_code == 200
-    assert "Generic CAM Studio" in res.text
+    assert "VexCAM Studio" in res.text
 
 
 def test_api_upload_step(client):

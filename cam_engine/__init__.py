@@ -1,4 +1,4 @@
-"""cam_engine: generic, geometry-driven CAM planning and G-code generation.
+"""cam_engine: VexCAM geometry-driven CAM planning and G-code generation.
 
 Architecture (data flows strictly downward; no stage reaches around another):
 

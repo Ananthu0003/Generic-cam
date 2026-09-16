@@ -53,6 +53,10 @@ def run_cam_pipeline(
     material_name: str = "aluminum_6061",
     model_to_setup: Optional[np.ndarray] = None,
     output_gcode_path: Optional[str | Path] = None,
+    stock_mode: str = "relative_box",
+    fixed_size: Optional[tuple[float, float, float]] = None,
+    cylinder_diameter: Optional[float] = None,
+    cylinder_length: Optional[float] = None,
 ) -> PipelineResult:
     """Execute the full CAM pipeline on an input STEP file."""
     path = Path(step_path)
@@ -67,9 +71,30 @@ def run_cam_pipeline(
     shape_in_setup = imported.shape.transformed(setup_transform)
     bmin, bmax = shape_in_setup.bounding_box()
 
-    stock_min = np.array([bmin[0] - margin_x, bmin[1] - margin_y, bmin[2] - margin_z_bottom])
-    stock_max = np.array([bmax[0] + margin_x, bmax[1] + margin_y, bmax[2] + margin_z_top])
-    stock = Stock(kind=StockKind.BOX, bounds_min=stock_min, bounds_max=stock_max)
+    if stock_mode == "cylinder":
+        cx = 0.5 * (bmin[0] + bmax[0])
+        cy = 0.5 * (bmin[1] + bmax[1])
+        rx = 0.5 * (bmax[0] - bmin[0])
+        ry = 0.5 * (bmax[1] - bmin[1])
+        part_r = float(np.hypot(rx, ry))
+        dia = float(cylinder_diameter if (cylinder_diameter and cylinder_diameter > 0) else (2.0 * (part_r + margin_x)))
+        radius = dia / 2.0
+        z_top = float(bmax[2] + margin_z_top)
+        z_bot = z_top - float(cylinder_length) if (cylinder_length and cylinder_length > 0) else float(bmin[2] - margin_z_bottom)
+        stock = Stock.from_cylinder(center_xy=np.array([cx, cy]), z_min=z_bot, z_max=z_top, radius=radius)
+    elif stock_mode == "fixed_box" and fixed_size is not None:
+        fx, fy, fz = fixed_size
+        cx = 0.5 * (bmin[0] + bmax[0])
+        cy = 0.5 * (bmin[1] + bmax[1])
+        z_top = float(bmax[2] + margin_z_top)
+        z_bot = z_top - float(fz)
+        stock_min = np.array([cx - fx / 2.0, cy - fy / 2.0, z_bot])
+        stock_max = np.array([cx + fx / 2.0, cy + fy / 2.0, z_top])
+        stock = Stock(kind=StockKind.BOX, bounds_min=stock_min, bounds_max=stock_max)
+    else:
+        stock_min = np.array([bmin[0] - margin_x, bmin[1] - margin_y, bmin[2] - margin_z_bottom])
+        stock_max = np.array([bmax[0] + margin_x, bmax[1] + margin_y, bmax[2] + margin_z_top])
+        stock = Stock(kind=StockKind.BOX, bounds_min=stock_min, bounds_max=stock_max)
 
     wo_enum = None
     for w in WorkOffset:

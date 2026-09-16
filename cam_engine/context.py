@@ -162,28 +162,28 @@ class Material:
 DEFAULT_MATERIALS: dict[str, Material] = {
     "aluminum_6061": Material(
         id="aluminum_6061", name="Aluminum 6061-T6", hardness_hb=95,
-        specific_cutting_force_kn_mm2=0.7, v_carbide=250.0, v_hss=90.0,
-        max_hm_ratio=0.5, max_ae_ratio=0.7, needs_coolant=True),
+        specific_cutting_force_kn_mm2=0.7, v_carbide=450.0, v_hss=120.0,
+        max_hm_ratio=1.0, max_ae_ratio=0.75, needs_coolant=True),
     "steel_1018": Material(
         id="steel_1018", name="Steel 1018 Low Carbon", hardness_hb=126,
-        specific_cutting_force_kn_mm2=1.5, v_carbide=120.0, v_hss=25.0,
-        max_hm_ratio=0.5, max_ae_ratio=0.7, needs_coolant=True),
+        specific_cutting_force_kn_mm2=1.5, v_carbide=180.0, v_hss=35.0,
+        max_hm_ratio=0.75, max_ae_ratio=0.7, needs_coolant=True),
     "steel_4140": Material(
         id="steel_4140", name="Steel 4140 Pre-Hard", hardness_hb=280,
-        specific_cutting_force_kn_mm2=2.1, v_carbide=80.0, v_hss=15.0,
-        max_hm_ratio=0.4, max_ae_ratio=0.6, needs_coolant=True),
+        specific_cutting_force_kn_mm2=2.1, v_carbide=110.0, v_hss=20.0,
+        max_hm_ratio=0.5, max_ae_ratio=0.6, needs_coolant=True),
     "stainless_304": Material(
         id="stainless_304", name="Stainless 304", hardness_hb=170,
-        specific_cutting_force_kn_mm2=2.0, v_carbide=70.0, v_hss=12.0,
-        max_hm_ratio=0.35, max_ae_ratio=0.5, needs_coolant=True),
+        specific_cutting_force_kn_mm2=2.0, v_carbide=95.0, v_hss=18.0,
+        max_hm_ratio=0.5, max_ae_ratio=0.55, needs_coolant=True),
     "brass_360": Material(
         id="brass_360", name="Brass 360 Free Machining", hardness_hb=80,
-        specific_cutting_force_kn_mm2=0.65, v_carbide=180.0, v_hss=70.0,
-        max_hm_ratio=0.5, max_ae_ratio=0.7, needs_coolant=False),
+        specific_cutting_force_kn_mm2=0.65, v_carbide=320.0, v_hss=90.0,
+        max_hm_ratio=1.0, max_ae_ratio=0.75, needs_coolant=False),
     "delrin_acetal": Material(
         id="delrin_acetal", name="Delrin Acetal", hardness_hb=20,
-        specific_cutting_force_kn_mm2=0.35, v_carbide=300.0, v_hss=120.0,
-        max_hm_ratio=0.6, max_ae_ratio=0.8, needs_coolant=False),
+        specific_cutting_force_kn_mm2=0.35, v_carbide=500.0, v_hss=160.0,
+        max_hm_ratio=1.2, max_ae_ratio=0.8, needs_coolant=False),
 }
 
 
@@ -220,6 +220,15 @@ class Stock:
 
     def top_z(self) -> float:
         return float(self.bounds_max[2])
+
+    def dimension_description(self) -> str:
+        """Format stock dimensions for reports and setup sheets."""
+        if self.kind is StockKind.CYLINDER and self.cylinder_radius is not None:
+            dia = self.cylinder_radius * 2.0
+            height = float(self.bounds_max[2] - self.bounds_min[2])
+            return f"Ø{dia:.1f} x {height:.1f} mm (Cylindrical Bar)"
+        dims = self.bounds_max - self.bounds_min
+        return f"{dims[0]:.1f} x {dims[1]:.1f} x {dims[2]:.1f} mm (Rectangular Block)"
 
     @classmethod
     def from_cylinder(cls, center_xy: np.ndarray, z_min: float, z_max: float,

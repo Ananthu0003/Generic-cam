@@ -1,4 +1,4 @@
-"""Command-line interface for Generic CAM Engine."""
+"""Command-line interface for VexCAM Engine."""
 
 import argparse
 import sys
@@ -9,7 +9,7 @@ from .pipeline import run_cam_pipeline
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generic CAM CLI: Generate CNC toolpaths & G-code directly from a STEP file.",
+        description="VexCAM CLI: Generate CNC toolpaths & G-code directly from a STEP file.",
     )
     parser.add_argument("step_file", type=str, help="Path to input .step / .stp CAD file")
     parser.add_argument(

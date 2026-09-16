@@ -84,17 +84,26 @@ class VoxelStock:
         hi = np.minimum(self.world_to_index(c) + r_idx + 1, d)
         if np.any(lo >= hi):
             return 0
-        grids = np.indices(hi - lo).reshape(3, -1).T + lo
-        centers = self.index_to_world(grids)
-        dist2 = ((centers - c) ** 2).sum(axis=1)
-        mask = dist2 <= radius * radius
-        cells = grids[mask]
-        removed = 0
-        for cell in cells:
-            i, j, k = int(cell[0]), int(cell[1]), int(cell[2])
-            if self.voxels[i, j, k]:
-                self.voxels[i, j, k] = False
-                removed += 1
+        lo_i, lo_j, lo_k = lo
+        hi_i, hi_j, hi_k = hi
+        # Coordinate grid for bounding box
+        i_idx = np.arange(lo_i, hi_i)
+        j_idx = np.arange(lo_j, hi_j)
+        k_idx = np.arange(lo_k, hi_k)
+        
+        # Center in world coordinates
+        ci = self.origin[0] + i_idx * self.voxel_size - c[0]
+        cj = self.origin[1] + j_idx * self.voxel_size - c[1]
+        ck = self.origin[2] + k_idx * self.voxel_size - c[2]
+        
+        # 3D broadcasted squared distance
+        dist2_3d = ci[:, None, None] ** 2 + cj[None, :, None] ** 2 + ck[None, None, :] ** 2
+        sphere_mask = dist2_3d <= (radius * radius)
+        
+        sub_grid = self.voxels[lo_i:hi_i, lo_j:hi_j, lo_k:hi_k]
+        to_remove = sub_grid & sphere_mask
+        removed = int(np.count_nonzero(to_remove))
+        sub_grid[sphere_mask] = False
         return removed
 
     def remove_capsule(self, p0: np.ndarray, p1: np.ndarray, radius: float) -> int:
@@ -152,3 +161,36 @@ class VoxelStock:
                 if c[2] > model_top + 1e-6:
                     excess_count += 1
         return excess_count * self.voxel_size ** 3
+
+    def transformed(self, matrix_4x4: np.ndarray, new_bmin: np.ndarray,
+                    new_bmax: np.ndarray, resolution: float) -> "VoxelStock":
+        """Transform this in-process voxel stock into a new setup's coordinate frame."""
+        new_stock = VoxelStock.from_bounds(new_bmin, new_bmax, resolution)
+        new_dims = new_stock.voxels.shape
+        idx = np.indices(new_dims).reshape(3, -1).T
+        centers_2 = new_stock.origin + idx * new_stock.voxel_size
+
+        try:
+            T_inv = np.linalg.inv(matrix_4x4)
+        except np.linalg.LinAlgError:
+            T_inv = np.eye(4)
+
+        ones = np.ones((len(centers_2), 1))
+        c2_hom = np.hstack([centers_2, ones])
+        c1_hom = (T_inv @ c2_hom.T).T
+        denom = c1_hom[:, 3:4]
+        denom[np.abs(denom) < 1e-12] = 1.0
+        c1 = c1_hom[:, :3] / denom
+
+        idx_1 = np.floor((c1 - self.origin) / self.voxel_size + 0.5).astype(int)
+        d = np.array(self.voxels.shape)
+        valid = (idx_1[:, 0] >= 0) & (idx_1[:, 0] < d[0]) & \
+                (idx_1[:, 1] >= 0) & (idx_1[:, 1] < d[1]) & \
+                (idx_1[:, 2] >= 0) & (idx_1[:, 2] < d[2])
+
+        new_voxels_flat = np.zeros(len(centers_2), dtype=bool)
+        valid_idx = idx_1[valid]
+        new_voxels_flat[valid] = self.voxels[valid_idx[:, 0], valid_idx[:, 1], valid_idx[:, 2]]
+        new_stock.voxels = new_voxels_flat.reshape(new_dims)
+        return new_stock
+

@@ -74,6 +74,8 @@ class StrategyEngine:
         if op.purpose is OpPurpose.ROUGHING:
             if op.notes.get("method") == "adaptive":
                 return self._adaptive_roughing(op)
+            if op.notes.get("method") == "helical_interpolation" or op.feature.type in (FeatureType.BORE, FeatureType.THROUGH_BORE, FeatureType.BLIND_BORE):
+                return self._helical_interpolation(op)
             return self._roughing(op)
         if op.purpose is OpPurpose.REST_MACHINING:
             return self._rest_machining(op)
@@ -458,9 +460,38 @@ class StrategyEngine:
         hull = lower[:-1] + upper[:-1]
         return [np.array(p, dtype=float) for p in hull]
 
-    def _feature_boundary_polygon(self, f: MachiningFeature) -> list[np.ndarray]:
+    def _feature_boundary_polygon(self, f: MachiningFeature, tool_radius: float = 0.0) -> list[np.ndarray]:
         """Extract a 2D boundary polygon from the feature's wall faces.
-        Uses actual boundary_loop when available, then convex hull of face points, falls back to bounding-box."""
+        For open features (Step, Shoulder, Open Pocket/Slot), extends open boundaries into open air
+        by (tool_radius + 1.0mm) to prevent standing corner slivers."""
+        is_open = f.type in (FeatureType.STEP, FeatureType.OPEN_POCKET, FeatureType.OPEN_SLOT, FeatureType.SHOULDER) or f.notes.get("is_open", False)
+        
+        if is_open and tool_radius > 0:
+            extension = tool_radius * 1.2 + 1.0
+            bmin, bmax = f.bounds_min[:2].copy(), f.bounds_max[:2].copy()
+            model_bmin = self.s.setup.stock.bounds_min[:2]
+            model_bmax = self.s.setup.stock.bounds_max[:2]
+            if hasattr(self.s, "mesh") and self.s.mesh is not None and hasattr(self.s.mesh, "bounds_min"):
+                model_bmin = self.s.mesh.bounds_min[:2]
+                model_bmax = self.s.mesh.bounds_max[:2]
+            
+            # Check which boundaries are open (coinciding with or touching outer model bounds)
+            if abs(bmin[0] - model_bmin[0]) < 1.0:
+                bmin[0] -= extension
+            if abs(bmax[0] - model_bmax[0]) < 1.0:
+                bmax[0] += extension
+            if abs(bmin[1] - model_bmin[1]) < 1.0:
+                bmin[1] -= extension
+            if abs(bmax[1] - model_bmax[1]) < 1.0:
+                bmax[1] += extension
+            
+            return [
+                np.array([bmin[0], bmin[1]]),
+                np.array([bmax[0], bmin[1]]),
+                np.array([bmax[0], bmax[1]]),
+                np.array([bmin[0], bmax[1]]),
+            ]
+
         # Use actual boundary geometry if the recognizer extracted it
         if f.boundary_loop and len(f.boundary_loop) >= 3:
             return [np.array([p[0], p[1]], dtype=float) for p in f.boundary_loop]
@@ -498,7 +529,7 @@ class StrategyEngine:
         """Generate offset polygon contour passes at a given Z level.
         Handles islands (internal obstacles) by generating offset contours
         around both the outer boundary and each island."""
-        boundary = self._feature_boundary_polygon(f)
+        boundary = self._feature_boundary_polygon(f, tool_radius)
         inset0 = tool_radius + finish_wall
         bmin = np.min(boundary, axis=0)
         bmax = np.max(boundary, axis=0)
@@ -665,9 +696,12 @@ class StrategyEngine:
                     continue
                 if first_entry:
                     self._link_to(tp, op, pts[0])
-                    self._helical_ramp(tp, op, pts[0],
-                                       helix_radius=min(radius * 0.8, stepover * 0.4),
-                                       pitch=min(stepdown, tool.diameter * 0.3))
+                    # Helical ramp entry is only needed for enclosed concave pockets.
+                    # Outer contours, bosses, steps, and open regions enter from free air/stock margin.
+                    if f.is_concave and f.type not in (FeatureType.CONTOUR, FeatureType.BOSS, FeatureType.FACING_REGION, FeatureType.STEP):
+                        self._helical_ramp(tp, op, pts[0],
+                                           helix_radius=min(radius * 0.8, stepover * 0.4),
+                                           pitch=min(stepdown, tool.diameter * 0.3))
                     first_entry = False
                 else:
                     # stay-down link for nearby contour points
@@ -868,9 +902,12 @@ class StrategyEngine:
                 pts_3d = [self._v3(p[0], p[1], z_level) for p in offset_poly]
                 if first_entry:
                     self._link_to(tp, op, pts_3d[0])
-                    self._helical_ramp(tp, op, pts_3d[0],
-                                       helix_radius=min(ae, radius * 0.3),
-                                       pitch=min(stepdown, tool.diameter * 0.3))
+                    # Helical ramp entry is only needed for enclosed concave pockets.
+                    # Outer contours, bosses, steps, and open regions enter from free air/stock margin.
+                    if f.is_concave and f.type not in (FeatureType.CONTOUR, FeatureType.BOSS, FeatureType.FACING_REGION, FeatureType.STEP):
+                        self._helical_ramp(tp, op, pts_3d[0],
+                                           helix_radius=min(ae, radius * 0.3),
+                                           pitch=min(stepdown, tool.diameter * 0.3))
                     first_entry = False
                 else:
                     prev_end = self._seg_end(tp)
@@ -1010,7 +1047,102 @@ class StrategyEngine:
             return self._finish_pencil(op)
         if method == "radial":
             return self._finish_radial(op)
+        if f.type in (FeatureType.BORE, FeatureType.THROUGH_BORE, FeatureType.BLIND_BORE) or (f.type == FeatureType.POCKET and f.notes.get("is_circular", False)):
+            return self._helical_interpolation(op)
+        if (f.type in (FeatureType.BOSS, FeatureType.CONTOUR) and (f.notes.get("is_circular", False) or (f.diameter is not None and f.diameter > 0 and f.type == FeatureType.BOSS))):
+            return self._boss_circular_contour(op)
         return self._finish_wall_floor(op)
+
+    def _boss_circular_contour(self, op: PlannedOperation) -> Toolpath:
+        """Circular boss & cylindrical model finishing: full circular G2/G3 arc passes with
+        tangential circular lead-in and lead-out in free air outside the workpiece,
+        complete with cutter radius compensation (G41/G42)."""
+        tp = self._toolpath_skeleton(op)
+        self._start_op(tp, op)
+        f = op.feature
+        tool = op.tool
+        params = op.params
+        center = f.center_xy
+        r_boss = (f.diameter / 2.0) if (f.diameter is not None and f.diameter > 0) else (f.radius if (f.radius is not None and f.radius > 0) else (f.bounds_max[0] - f.bounds_min[0]) / 2.0)
+        r_tool = tool.diameter / 2.0
+        r_path = r_boss + r_tool
+        top_z = f.top_z
+        floor_z = f.floor_z
+        doc = max(params.depth_of_cut_mm, 1e-3)
+        bands = max(1, int(np.ceil((top_z - floor_z) / doc)))
+        comp_d = tool.tool_number if tool.tool_number else 1
+        lead_r = max(r_tool * 0.8, 1.0)
+
+        for b in range(bands):
+            z_band = max(floor_z, top_z - (b + 1) * doc) if bands > 1 else floor_z
+            approach_pt = self._v3(center[0] + r_path + 2.0 * lead_r, center[1], z_band)
+            start_cut_pt = self._v3(center[0] + r_path, center[1], z_band)
+            departure_pt = self._v3(center[0] + r_path + 2.0 * lead_r, center[1], z_band)
+
+            self._link_to(tp, op, approach_pt)
+
+            tp.add(MotionSegment(
+                motion_type=MotionType.ENTRY,
+                start=approach_pt,
+                end=start_cut_pt,
+                arc_center=self._v3(center[0] + r_path + lead_r, center[1], z_band),
+                arc_ccw=True,
+                feed=params.feed_rate,
+                spindle=params.spindle_rpm,
+                tool_id=tool.id,
+                operation_id=op.id,
+                feature_id=f.id,
+                metadata={"cutter_comp": {"side": "left", "action": "on", "d_register": comp_d}}
+            ))
+
+            quads = [
+                self._v3(center[0], center[1] + r_path, z_band),
+                self._v3(center[0] - r_path, center[1], z_band),
+                self._v3(center[0], center[1] - r_path, z_band),
+                self._v3(center[0] + r_path, center[1], z_band),
+            ]
+            prev = start_cut_pt
+            for q in quads:
+                tp.add(MotionSegment(
+                    motion_type=MotionType.ARC_CCW,
+                    start=prev,
+                    end=q,
+                    arc_center=self._v3(center[0], center[1], z_band),
+                    arc_ccw=True,
+                    feed=params.feed_rate,
+                    spindle=params.spindle_rpm,
+                    tool_id=tool.id,
+                    operation_id=op.id,
+                    feature_id=f.id
+                ))
+                prev = q
+
+            tp.add(MotionSegment(
+                motion_type=MotionType.EXIT,
+                start=prev,
+                end=departure_pt,
+                arc_center=self._v3(center[0] + r_path + lead_r, center[1], z_band),
+                arc_ccw=True,
+                feed=params.feed_rate,
+                spindle=params.spindle_rpm,
+                tool_id=tool.id,
+                operation_id=op.id,
+                feature_id=f.id,
+                metadata={"cutter_comp": {"action": "off"}}
+            ))
+
+        retract_start = self._seg_end(tp)
+        tp.add(MotionSegment(
+            motion_type=MotionType.RETRACT,
+            start=retract_start,
+            end=self._v3(retract_start[0], retract_start[1], self.s.clearance_z),
+            tool_id=tool.id,
+            operation_id=op.id,
+            feature_id=f.id
+        ))
+        self._end_op(tp, op)
+        tp.metadata["strategy"] = "circular_boss_contour"
+        return tp
 
     def _finish_wall_floor(self, op: PlannedOperation) -> Toolpath:
         """Contour finishing: full-depth wall pass + floor pass, engagement-aware."""
@@ -1020,14 +1152,33 @@ class StrategyEngine:
         tool = op.tool
         params = op.params
         radius = tool.diameter / 2.0
-        bmin, bmax = f.bounds_min, f.bounds_max
-        extents = bmax[:2] - bmin[:2]
+        model_bmin = self.s.setup.stock.bounds_min[:2]
+        model_bmax = self.s.setup.stock.bounds_max[:2]
+        if hasattr(self.s, "mesh") and self.s.mesh is not None and hasattr(self.s.mesh, "bounds_min"):
+            model_bmin = self.s.mesh.bounds_min[:2]
+            model_bmax = self.s.mesh.bounds_max[:2]
 
-        wall_inset = -radius if (not f.is_concave and f.type in (FeatureType.CONTOUR, FeatureType.BOSS)) else radius
-        cx, cy = 0.5 * (bmin[0] + bmax[0]), 0.5 * (bmin[1] + bmax[1])
-        hx = extents[0] / 2.0 - wall_inset
-        hy = extents[1] / 2.0 - wall_inset
-        if hx < -1e-9 or hy < -1e-9:
+        bmin = f.bounds_min[:2]
+        bmax = f.bounds_max[:2]
+        is_open_feat = f.type in (FeatureType.STEP, FeatureType.OPEN_POCKET, FeatureType.OPEN_SLOT, FeatureType.SHOULDER) or f.notes.get("is_open", False)
+
+        if f.type in (FeatureType.CONTOUR, FeatureType.BOSS):
+            x_min = bmin[0] - radius
+            x_max = bmax[0] + radius
+            y_min = bmin[1] - radius
+            y_max = bmax[1] + radius
+        elif is_open_feat:
+            x_min = (bmin[0] - radius) if abs(bmin[0] - model_bmin[0]) < 1.0 else (bmin[0] + radius)
+            x_max = (bmax[0] + radius) if abs(bmax[0] - model_bmax[0]) < 1.0 else (bmax[0] - radius)
+            y_min = (bmin[1] - radius) if abs(bmin[1] - model_bmin[1]) < 1.0 else (bmin[1] + radius)
+            y_max = (bmax[1] + radius) if abs(bmax[1] - model_bmax[1]) < 1.0 else (bmax[1] - radius)
+        else:
+            x_min = bmin[0] + radius
+            x_max = bmax[0] - radius
+            y_min = bmin[1] + radius
+            y_max = bmax[1] - radius
+
+        if (x_max < x_min - 1e-9) or (y_max < y_min - 1e-9):
             tp.metadata["skipped"] = "tool does not fit for finishing"
             self._end_op(tp, op)
             return tp
@@ -1035,14 +1186,8 @@ class StrategyEngine:
         # wall finishing: full depth contour with cutter compensation (G41)
         z = f.top_z
         floor_z = f.floor_z
-        corners = [self._v3(cx - hx, cy - hy, z), self._v3(cx + hx, cy - hy, z),
-                   self._v3(cx + hx, cy + hy, z), self._v3(cx - hx, cy + hy, z)]
-        pt = corners[0]
-        self._link_to(tp, op, pt)
-        # helical entry down the wall
-        self._helical_ramp(tp, op, self._v3(pt[0], pt[1], floor_z),
-                           helix_radius=min(abs(hx), abs(hy)) * 0.4,
-                           pitch=min(params.depth_of_cut_mm, tool.diameter * 0.3))
+        corners = [self._v3(x_min, y_min, z), self._v3(x_max, y_min, z),
+                   self._v3(x_max, y_max, z), self._v3(x_min, y_max, z)]
         # contour at floor level, then step up (axial spacing uses depth_of_cut,
         # not the radial stepover)
         doc = max(params.depth_of_cut_mm, 1e-3)
@@ -1050,16 +1195,21 @@ class StrategyEngine:
         comp_d = tool.tool_number if tool.tool_number else 1
         comp_vec = radius * 0.8  # linear lead-in/out displacement vector
 
+        is_outer = (not f.is_concave) or (f.type in (FeatureType.CONTOUR, FeatureType.BOSS))
         for b in range(bands):
             z_band = min(f.top_z, floor_z + b * doc)
             band_corners = [self._v3(c[0], c[1], z_band) for c in corners]
             c0 = band_corners[0]
-            # Approach point slightly inset from c0 for linear G41 engagement
-            approach_pt = self._v3(c0[0] + comp_vec, c0[1] + comp_vec, z_band)
-            departure_pt = self._v3(c0[0] + comp_vec, c0[1] + comp_vec, z_band)
+            # Approach point for linear G41 engagement:
+            # For outer contours: must be in open air outside the model, not inside the edge!
+            if is_outer:
+                approach_pt = self._v3(c0[0] - comp_vec, c0[1], z_band)
+                departure_pt = self._v3(c0[0], c0[1] - comp_vec, z_band)
+            else:
+                approach_pt = self._v3(c0[0] + comp_vec, c0[1] + comp_vec, z_band)
+                departure_pt = self._v3(c0[0] + comp_vec, c0[1] + comp_vec, z_band)
 
-            if b > 0:
-                self._link_to(tp, op, approach_pt)
+            self._link_to(tp, op, approach_pt)
 
             # Linear lead-in move engaging cutter compensation (G41)
             prev = self._seg_end(tp)
@@ -1096,8 +1246,19 @@ class StrategyEngine:
         # floor finishing: serpentine at floor level (skip for outer contours)
         if f.type is not FeatureType.CONTOUR:
             stepover = max(params.stepover_mm, 1e-3)
-            x0, x1 = bmin[0] + radius, bmax[0] - radius
-            y0, y1 = bmin[1] + radius, bmax[1] - radius
+            is_open_feat = f.type in (FeatureType.STEP, FeatureType.OPEN_POCKET, FeatureType.OPEN_SLOT, FeatureType.SHOULDER) or f.notes.get("is_open", False)
+            model_bmin = self.s.setup.stock.bounds_min[:2]
+            model_bmax = self.s.setup.stock.bounds_max[:2]
+            if hasattr(self.s, "mesh") and self.s.mesh is not None and hasattr(self.s.mesh, "bounds_min"):
+                model_bmin = self.s.mesh.bounds_min[:2]
+                model_bmax = self.s.mesh.bounds_max[:2]
+
+            # For closed walls, inset by radius; for open edges, extend past the boundary by radius to clear corners
+            x0 = (bmin[0] - radius) if (is_open_feat and abs(bmin[0] - model_bmin[0]) < 1.0) else (bmin[0] + radius)
+            x1 = (bmax[0] + radius) if (is_open_feat and abs(bmax[0] - model_bmax[0]) < 1.0) else (bmax[0] - radius)
+            y0 = (bmin[1] - radius) if (is_open_feat and abs(bmin[1] - model_bmin[1]) < 1.0) else (bmin[1] + radius)
+            y1 = (bmax[1] + radius) if (is_open_feat and abs(bmax[1] - model_bmax[1]) < 1.0) else (bmax[1] - radius)
+
             if x1 >= x0 and y1 >= y0:
                 n_rows = max(1, int(np.ceil((y1 - y0) / stepover)) + 1)
                 for r in range(n_rows):
@@ -1127,7 +1288,7 @@ class StrategyEngine:
         params = op.params
         mesh = self.s.mesh
 
-        scallop = 0.05
+        scallop = 0.12
         if f.finish is not None and getattr(f.finish, "allowed_scallop_mm", None):
             scallop = f.finish.allowed_scallop_mm
         r = tool.tip_radius if tool.type is ToolType.BALL_ENDMILL else tool.diameter / 2.0
@@ -1135,7 +1296,7 @@ class StrategyEngine:
             r = tool.diameter / 2.0
         # scallop -> stepover for ball tool on flat: s = 2*sqrt(2*R*h - h^2)
         stepover = 2.0 * np.sqrt(max(2.0 * r * scallop - scallop * scallop, 1e-6))
-        stepover = float(np.clip(stepover, 0.05, tool.diameter * 0.9))
+        stepover = float(np.clip(stepover, 0.1, tool.diameter * 0.9))
 
         bmin, bmax = f.bounds_min[:2], f.bounds_max[:2]
         margin = tool.diameter / 2.0
@@ -1146,7 +1307,7 @@ class StrategyEngine:
         first = True
         for row in range(n_rows):
             y = y0 + min(row * stepover, y1 - y0)
-            n_cols = max(2, int(np.ceil((x1 - x0) / max(tool.diameter * 0.2, 0.2))) + 1)
+            n_cols = max(2, int(np.ceil((x1 - x0) / max(tool.diameter * 0.35, 0.4))) + 1)
             xs = np.linspace(x0, x1, n_cols)
             pts: list[np.ndarray] = []
 
@@ -1232,7 +1393,7 @@ class StrategyEngine:
         params = op.params
         radius = tool.diameter / 2.0
 
-        scallop = 0.05
+        scallop = 0.12
         if f.finish is not None and getattr(f.finish, "allowed_scallop_mm", None):
             scallop = f.finish.allowed_scallop_mm
         r = tool.tip_radius if tool.type is ToolType.BALL_ENDMILL else radius
@@ -1242,7 +1403,7 @@ class StrategyEngine:
             z_step = 2.0 * math.sqrt(max(2.0 * r * scallop - scallop * scallop, 1e-6))
         else:
             z_step = scallop
-        z_step = float(np.clip(z_step, 0.1, params.stepover_mm))
+        z_step = float(np.clip(z_step, 0.15, params.stepover_mm))
 
         floor_z = f.floor_z + self.s.finish_allowance_floor
         top_z = f.top_z
@@ -1263,7 +1424,7 @@ class StrategyEngine:
             if hx < -1e-9 or hy < -1e-9:
                 continue
             # sample points along rectangular contour, adjusting Z via mesh
-            n_pts = max(4, int(np.ceil(max(extents) / max(tool.diameter * 0.2, 0.2))))
+            n_pts = max(4, int(np.ceil(max(extents) / max(tool.diameter * 0.35, 0.35))))
             contour_pts = []
             perimeter = 2 * (extents[0] + extents[1])
             for i in range(n_pts):
@@ -1329,7 +1490,7 @@ class StrategyEngine:
         radius = tool.diameter / 2.0
         mesh = self.s.mesh
 
-        scallop = 0.05
+        scallop = 0.12
         if f.finish is not None and getattr(f.finish, "allowed_scallop_mm", None):
             scallop = f.finish.allowed_scallop_mm
         r = tool.tip_radius if tool.type is ToolType.BALL_ENDMILL else radius
@@ -1343,13 +1504,13 @@ class StrategyEngine:
 
         # adaptive stepover based on local curvature
         base_stepover = 2.0 * np.sqrt(max(2.0 * r * scallop - scallop * scallop, 1e-6))
-        base_stepover = float(np.clip(base_stepover, 0.05, tool.diameter * 0.9))
+        base_stepover = float(np.clip(base_stepover, 0.1, tool.diameter * 0.9))
 
         n_rows = max(1, int(np.ceil((y1 - y0) / base_stepover)) + 1)
         first = True
         for row in range(n_rows):
             y = y0 + min(row * base_stepover, y1 - y0)
-            n_cols = max(2, int(np.ceil((x1 - x0) / max(tool.diameter * 0.15, 0.15))) + 1)
+            n_cols = max(2, int(np.ceil((x1 - x0) / max(tool.diameter * 0.35, 0.35))) + 1)
             xs = np.linspace(x0, x1, n_cols)
             pts: list[np.ndarray] = []
             for x in xs:
@@ -1643,7 +1804,9 @@ class StrategyEngine:
         return tp
 
     def _helical_interpolation(self, op: PlannedOperation) -> Toolpath:
-        """Open a hole larger than any drill by helical milling (arc segments)."""
+        """Open a hole or bore by continuous 3D helical milling with smooth tangential entry/exit.
+        For large bores (radius > 0.45 * tool.diameter), uses concentric multi-ring helical clearing
+        to evacuate 100% of material from center to finish wall."""
         tp = self._toolpath_skeleton(op)
         self._start_op(tp, op)
         f = op.feature
@@ -1651,63 +1814,130 @@ class StrategyEngine:
         params = op.params
         center = f.center_xy
         top_z, floor_z = f.top_z, f.floor_z
-        r_hole = f.diameter / 2.0
+        dia = f.diameter if (f.diameter is not None and f.diameter > 0) else (f.radius * 2.0 if (f.radius is not None and f.radius > 0) else (f.bounds_max[0] - f.bounds_min[0]))
+        r_hole = dia / 2.0
         r_tool = tool.diameter / 2.0
         r_path = r_hole - r_tool
-        if r_path <= 0:
+        if r_path <= 1e-4:
             raise CamError(UNSUPPORTED_FEATURE,
-                           f"hole {f.id}: tool too large for helical interpolation",
+                           f"hole/bore {f.id}: tool diameter {tool.diameter}mm exceeds or equals hole diameter {dia:.2f}mm",
                            stage="toolpath", operation_id=op.id, feature_id=f.id)
-        self._rapid_to(tp, op, self._v3(center[0] + r_path, center[1],
-                                        self.s.clearance_z))
-        prev = self._v3(center[0] + r_path, center[1], self.s.clearance_z)
-        tp.add(MotionSegment(motion_type=MotionType.RAPID, start=prev,
-                             end=self._v3(center[0] + r_path, center[1], top_z + 1.0),
-                             tool_id=tool.id, operation_id=op.id, feature_id=f.id))
-        z = top_z + 1.0
-        pitch = min(params.depth_of_cut_mm, tool.diameter * 0.5)
-        while z > floor_z + 1e-9:
-            z_next = max(floor_z, z - pitch)
-            n_seg = 12
+
+        # 1. Approach over center at clearance Z, then rapid to top_z + 1.0
+        self._rapid_to(tp, op, self._v3(center[0], center[1], self.s.clearance_z))
+        tp.add(MotionSegment(
+            motion_type=MotionType.RAPID,
+            start=self._v3(center[0], center[1], self.s.clearance_z),
+            end=self._v3(center[0], center[1], top_z + 1.0),
+            tool_id=tool.id, operation_id=op.id, feature_id=f.id
+        ))
+
+        # 2. Plunge down to top_z at plunge feed
+        tp.add(MotionSegment(
+            motion_type=MotionType.PLUNGE,
+            start=self._v3(center[0], center[1], top_z + 1.0),
+            end=self._v3(center[0], center[1], top_z),
+            feed=params.plunge_feed, spindle=params.spindle_rpm,
+            tool_id=tool.id, operation_id=op.id, feature_id=f.id
+        ))
+
+        # Multi-ring concentric passes if hole diameter significantly exceeds tool diameter
+        radial_step = max(0.5, min(params.stepover_mm, tool.diameter * 0.65))
+        n_rings = max(1, int(np.ceil(r_path / radial_step)))
+        ring_radii = [float(r_path * (k / n_rings)) for k in range(1, n_rings + 1)]
+        pitch = min(params.depth_of_cut_mm, tool.diameter * 0.5, 3.0)
+        n_seg = 4  # 4 quadrant arcs per 360-deg revolution
+
+        for ring_idx, r_curr in enumerate(ring_radii):
+            entry_center = self._v3(center[0] + r_curr / 2.0, center[1], top_z if ring_idx == 0 else floor_z)
+            start_pt = self._v3(center[0], center[1], top_z if ring_idx == 0 else floor_z)
+            if ring_idx > 0:
+                # Linear stepover to next ring at floor_z
+                prev = self._seg_end(tp)
+                tp.add(MotionSegment(
+                    motion_type=MotionType.CUT,
+                    start=prev,
+                    end=self._v3(center[0] + r_curr, center[1], floor_z),
+                    feed=params.feed_rate,
+                    spindle=params.spindle_rpm,
+                    tool_id=tool.id, operation_id=op.id, feature_id=f.id
+                ))
+            else:
+                tp.add(MotionSegment(
+                    motion_type=MotionType.ENTRY,
+                    start=start_pt,
+                    end=self._v3(center[0] + r_curr, center[1], top_z),
+                    arc_center=entry_center,
+                    arc_ccw=True,
+                    feed=params.feed_rate,
+                    spindle=params.spindle_rpm,
+                    tool_id=tool.id, operation_id=op.id, feature_id=f.id
+                ))
+
+            # Continuous helical descent down to floor_z (only needed for first ring)
+            if ring_idx == 0:
+                z = top_z
+                while z > floor_z + 1e-9:
+                    z_next = max(floor_z, z - pitch)
+                    for k in range(1, n_seg + 1):
+                        a0 = 2 * np.pi * (k - 1) / n_seg
+                        a1 = 2 * np.pi * k / n_seg
+                        z0 = z + (z_next - z) * (k - 1) / n_seg
+                        z1 = z + (z_next - z) * k / n_seg
+                        p0 = self._v3(center[0] + r_curr * np.cos(a0), center[1] + r_curr * np.sin(a0), z0)
+                        p1 = self._v3(center[0] + r_curr * np.cos(a1), center[1] + r_curr * np.sin(a1), z1)
+                        tp.add(MotionSegment(
+                            motion_type=MotionType.HELIX,
+                            start=p0,
+                            end=p1,
+                            arc_center=self._v3(center[0], center[1], z1),
+                            arc_ccw=True,
+                            feed=params.feed_rate,
+                            spindle=params.spindle_rpm,
+                            tool_id=tool.id, operation_id=op.id, feature_id=f.id
+                        ))
+                    z = z_next
+
+            # Full 360-degree flat circular pass at floor_z for current ring
             for k in range(1, n_seg + 1):
                 a0 = 2 * np.pi * (k - 1) / n_seg
                 a1 = 2 * np.pi * k / n_seg
-                p0 = self._v3(center[0] + r_path * np.cos(a0),
-                              center[1] + r_path * np.sin(a0),
-                              z + (z_next - z) * (k - 1) / n_seg)
-                p1 = self._v3(center[0] + r_path * np.cos(a1),
-                              center[1] + r_path * np.sin(a1),
-                              z + (z_next - z) * k / n_seg)
-                tp.add(MotionSegment(motion_type=MotionType.HELIX, start=p0, end=p1,
-                                     arc_center=self._v3(center[0], center[1], p1[2]),
-                                     arc_ccw=True, feed=params.feed_rate,
-                                     spindle=params.spindle_rpm, tool_id=tool.id,
-                                     operation_id=op.id, feature_id=f.id))
-            z = z_next
-        # final circular finish pass at floor
-        for k in range(1, 13):
-            a0 = 2 * np.pi * (k - 1) / 12
-            a1 = 2 * np.pi * k / 12
-            p0 = self._v3(center[0] + r_path * np.cos(a0),
-                          center[1] + r_path * np.sin(a0), floor_z)
-            p1 = self._v3(center[0] + r_path * np.cos(a1),
-                          center[1] + r_path * np.sin(a1), floor_z)
-            tp.add(MotionSegment(motion_type=MotionType.ARC_CCW, start=p0, end=p1,
-                                 arc_center=self._v3(center[0], center[1], floor_z),
-                                 arc_ccw=True, feed=params.feed_rate,
-                                 spindle=params.spindle_rpm, tool_id=tool.id,
-                                 operation_id=op.id, feature_id=f.id))
-        last = self._seg_end(tp)
-        tp.add(MotionSegment(motion_type=MotionType.CUT, start=last,
-                             end=self._v3(center[0], center[1], floor_z),
-                             feed=params.feed_rate, tool_id=tool.id,
-                             operation_id=op.id, feature_id=f.id))
-        retract_start = self._seg_end(tp)
-        tp.add(MotionSegment(motion_type=MotionType.RETRACT, start=retract_start,
-                             end=self._v3(center[0], center[1], self.s.clearance_z),
-                             tool_id=tool.id, operation_id=op.id, feature_id=f.id))
+                p0 = self._v3(center[0] + r_curr * np.cos(a0), center[1] + r_curr * np.sin(a0), floor_z)
+                p1 = self._v3(center[0] + r_curr * np.cos(a1), center[1] + r_curr * np.sin(a1), floor_z)
+                tp.add(MotionSegment(
+                    motion_type=MotionType.ARC_CCW,
+                    start=p0,
+                    end=p1,
+                    arc_center=self._v3(center[0], center[1], floor_z),
+                    arc_ccw=True,
+                    feed=params.feed_rate,
+                    spindle=params.spindle_rpm,
+                    tool_id=tool.id, operation_id=op.id, feature_id=f.id
+                ))
+
+        # Final tangential circular lead-out arc back to center
+        tp.add(MotionSegment(
+            motion_type=MotionType.EXIT,
+            start=self._v3(center[0] + r_path, center[1], floor_z),
+            end=self._v3(center[0], center[1], floor_z),
+            arc_center=self._v3(center[0] + r_path / 2.0, center[1], floor_z),
+            arc_ccw=True,
+            feed=params.feed_rate,
+            spindle=params.spindle_rpm,
+            tool_id=tool.id, operation_id=op.id, feature_id=f.id
+        ))
+
+        # Retract straight up from center to clearance Z
+        tp.add(MotionSegment(
+            motion_type=MotionType.RETRACT,
+            start=self._v3(center[0], center[1], floor_z),
+            end=self._v3(center[0], center[1], self.s.clearance_z),
+            tool_id=tool.id, operation_id=op.id, feature_id=f.id
+        ))
+
         self._end_op(tp, op)
         tp.metadata["strategy"] = "helical_interpolation"
+        tp.metadata["concentric_rings"] = len(ring_radii)
         return tp
 
     # ----------------------------------------------------------- boring --

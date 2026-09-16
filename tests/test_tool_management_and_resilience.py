@@ -140,3 +140,52 @@ def test_tool_api_endpoints():
     res_del = client.delete(f"/api/tools/{added_tool['id']}")
     assert res_del.status_code == 200
     assert len(res_del.json()["tools"]) == initial_count
+
+
+def test_counterbore_suggests_flat_endmill_and_replanning():
+    ctx = make_test_context()
+    setup = make_setup()
+
+    # Counterbore of 0.58mm dia
+    cbore = MachiningFeature(
+        id="cbore_micro",
+        type=FeatureType.COUNTERBORE,
+        face_indices=[1],
+        bounds_min=np.array([10.0, 10.0, 20.0]),
+        bounds_max=np.array([10.58, 10.58, 25.0]),
+        depth=5.0,
+        top_z=25.0,
+        floor_z=20.0,
+        diameter=0.58,
+        is_concave=True,
+    )
+
+    planner = OperationPlanner(ctx, setup, [cbore])
+    ops = planner.plan()
+
+    assert len(planner.warnings) == 1
+    w = planner.warnings[0]
+    assert w["code"] == "MISSING_TOOL"
+    assert w["suggested_tool"]["type"] == "flat_endmill"
+    assert w["suggested_tool"]["diameter"] < 0.58
+
+    # Now add the suggested flat endmill
+    sugg = w["suggested_tool"]
+    tool_added = Tool(
+        id="T99",
+        tool_number=99,
+        type=ToolType.FLAT_ENDMILL,
+        diameter=sugg["diameter"],
+        flute_length=sugg["flute_length"],
+        overall_length=sugg["overall_length"],
+        flutes=sugg["flutes"],
+    )
+    ctx.tools.append(tool_added)
+
+    planner2 = OperationPlanner(ctx, setup, [cbore])
+    ops2 = planner2.plan()
+    assert len(planner2.warnings) == 0
+    assert len(ops2) == 1
+    assert ops2[0].feature.id == "cbore_micro"
+    assert ops2[0].notes.get("method") == "helical_interpolation"
+

@@ -75,15 +75,15 @@ class MachinabilityAnalyzer:
         rpm = float(np.clip(rpm, self.machine.spindle_min_rpm, self.machine.spindle_max_rpm))
 
         # --- feed per tooth from tool geometry + material hardness ---
-        # base chip load scales with diameter and decreases with hardness
-        fz_base = 0.012 * tool.diameter * (100.0 / max(self.material.hardness_hb, 10.0)) ** 0.35
+        # base chip load scales with diameter and decreases with hardness (industrial carbide basis)
+        fz_base = 0.018 * tool.diameter * (100.0 / max(self.material.hardness_hb, 10.0)) ** 0.35
         if op_purpose == "finishing":
-            fz_base *= 0.45
+            fz_base *= 0.60
         elif op_purpose == "semi_finishing":
-            fz_base *= 0.7
+            fz_base *= 0.80
         elif op_purpose == "roughing":
-            fz_base *= 1.1
-        fz = float(np.clip(fz_base, 0.005, 0.35))
+            fz_base *= 1.15
+        fz = float(np.clip(fz_base, 0.005, 0.40))
 
         flutes = max(1, tool.flutes)
         feed = rpm * flutes * fz
@@ -96,21 +96,21 @@ class MachinabilityAnalyzer:
         if op_purpose == "roughing":
             stepdown = max_hm
         elif op_purpose in ("semi_finishing", "finishing"):
-            stepdown = min(max_hm, max(0.2 * tool.diameter, 0.3))
+            stepdown = min(max_hm, max(0.4 * tool.diameter, 0.5))
 
         stepover = max_ae
         if op_purpose == "roughing":
             stepover = max_ae
         elif op_purpose == "semi_finishing":
-            stepover = 0.4 * tool.diameter
+            stepover = 0.45 * tool.diameter
         elif op_purpose == "finishing":
             stepover = self._finish_stepover(tool)
 
         # clamp feed to machine axis capability
         max_feed = min(ax.max_feed for ax in self.machine.axes.values())
         feed = float(min(feed, max_feed))
-        plunge = float(min(feed * 0.33, max_feed))
-        ramp = float(min(feed * 0.5, max_feed))
+        plunge = float(min(feed * 0.40, max_feed))
+        ramp = float(min(feed * 0.70, max_feed))
 
         # engagement angle for slotting approx: ae = D*sin(theta/2) -> theta = 2*asin(ae/D)
         ae_ratio = min(1.0, stepover / tool.diameter)

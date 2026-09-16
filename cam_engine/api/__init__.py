@@ -1,4 +1,4 @@
-"""API package for generic-cam."""
+"""API package for VexCAM."""
 
 from .routes import router
 
