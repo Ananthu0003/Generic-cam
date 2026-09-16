@@ -1,4 +1,4 @@
-"""FastAPI Application entry point for Generic CAM."""
+"""FastAPI Application entry point for VexCAM."""
 
 from pathlib import Path
 from fastapi import FastAPI
@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 from cam_engine.api import router as cam_router
 
 app = FastAPI(
-    title="Generic CAM Studio API",
+    title="VexCAM Studio API",
     description="Geometry-driven CAM toolpath planning and G-code generation engine",
     version="0.1.0",
 )
@@ -50,7 +50,7 @@ async def serve_index():
     index_file = STATIC_DIR / "index.html"
     if index_file.exists():
         return FileResponse(index_file)
-    return {"status": "Generic CAM API is running", "docs": "/docs"}
+    return {"status": "VexCAM API is running", "docs": "/docs"}
 
 
 if __name__ == "__main__":

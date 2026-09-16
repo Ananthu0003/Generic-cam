@@ -1,4 +1,4 @@
-"""Post-processor module for generic-cam."""
+"""Post-processor module for VexCAM."""
 
 from .post_processor import (
     BasePostProcessor,

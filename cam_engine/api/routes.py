@@ -1,14 +1,17 @@
-"""FastAPI REST API routes for Generic CAM."""
+"""FastAPI REST API routes for VexCAM."""
 
 from __future__ import annotations
 
+import io
+import zipfile
 import tempfile
 import uuid
 import time
 from pathlib import Path
 from typing import Optional
 import numpy as np
-from fastapi import APIRouter, UploadFile, File, HTTPException, Request
+from fastapi import APIRouter, UploadFile, File, HTTPException, Request, Response
+
 
 from ..context import (
     PlanningContext,
@@ -34,7 +37,7 @@ from ..machinability import CuttingParameters
 from ..toolpaths.strategies import StrategyEngine, StrategyContext
 from ..toolpaths.semantic import Toolpath, MotionSegment, MotionType
 from ..geometry.step_import import import_step, ImportedModel
-from ..geometry.topology import Shape
+from ..geometry.topology import Shape, SurfaceKind
 from ..geometry.mesh import TriangleMesh
 from ..geometry.voxel import VoxelStock
 from ..post import get_post_processor
@@ -60,6 +63,7 @@ from .models import (
     OrientModelRequest,
     SetupItem,
     AddSetupRequest,
+    UpdateSetupRequest,
     SetupsListResponse,
     PlanOpsRequest,
     PlannedOpItem,
@@ -88,6 +92,83 @@ def _euler_to_matrix(rx_deg: float, ry_deg: float, rz_deg: float) -> np.ndarray:
     T = np.eye(4, dtype=float)
     T[:3, :3] = R
     return T
+
+
+def _create_stock_from_config(cfg: StockConfig, bmin: list[float] | np.ndarray, bmax: list[float] | np.ndarray) -> Stock:
+    bmin = np.asarray(bmin, dtype=float)
+    bmax = np.asarray(bmax, dtype=float)
+    mode = getattr(cfg, "stock_mode", "relative_box") or "relative_box"
+    off_x = getattr(cfg, "offset_x", 0.0) or 0.0
+    off_y = getattr(cfg, "offset_y", 0.0) or 0.0
+    off_z = getattr(cfg, "offset_z", 0.0) or 0.0
+
+    if mode in ("relative_cylinder", "cylinder", "fixed_cylinder"):
+        cx = 0.5 * (bmin[0] + bmax[0]) + off_x
+        cy = 0.5 * (bmin[1] + bmax[1]) + off_y
+        rx = 0.5 * (bmax[0] - bmin[0])
+        ry = 0.5 * (bmax[1] - bmin[1])
+        part_r = float(np.hypot(rx, ry))
+
+        top_margin = getattr(cfg, "cylinder_margin_axial_top", 1.0) if getattr(cfg, "cylinder_margin_axial_top", None) is not None else 1.0
+        bot_margin = getattr(cfg, "cylinder_margin_axial_bot", 3.0) if getattr(cfg, "cylinder_margin_axial_bot", None) is not None else 3.0
+        z_top = float(bmax[2] + top_margin + off_z)
+
+        if mode == "fixed_cylinder":
+            # Exact purchased bar diameter and length
+            dia = float(cfg.cylinder_diameter if (cfg.cylinder_diameter and cfg.cylinder_diameter > 0) else (2.0 * (part_r + 2.5)))
+            radius = dia / 2.0
+            if cfg.cylinder_length and cfg.cylinder_length > 0:
+                z_bot = z_top - float(cfg.cylinder_length)
+            else:
+                z_bot = float(bmin[2] - bot_margin + off_z)
+        else:
+            # relative_cylinder: auto-calculate diameter from part radius + radial margin
+            radial_margin = getattr(cfg, "cylinder_margin_radial", 2.5) if getattr(cfg, "cylinder_margin_radial", None) is not None else 2.5
+            dia = float(cfg.cylinder_diameter if (cfg.cylinder_diameter and cfg.cylinder_diameter > 0) else (2.0 * (part_r + radial_margin)))
+            radius = dia / 2.0
+            z_bot = float(bmin[2] - bot_margin + off_z)
+
+        axis_str = str(getattr(cfg, "cylinder_axis", "Z") or "Z").upper()
+        if axis_str == "X":
+            axis_vec = np.array([1.0, 0.0, 0.0])
+        elif axis_str == "Y":
+            axis_vec = np.array([0.0, 1.0, 0.0])
+        else:
+            axis_vec = np.array([0.0, 0.0, 1.0])
+
+        return Stock.from_cylinder(center_xy=np.array([cx, cy]), z_min=z_bot, z_max=z_top, radius=radius, axis=axis_vec)
+
+    elif mode == "fixed_box":
+        part_sx = float(bmax[0] - bmin[0])
+        part_sy = float(bmax[1] - bmin[1])
+        part_sz = float(bmax[2] - bmin[2])
+
+        fx = float(cfg.fixed_size_x if (cfg.fixed_size_x and cfg.fixed_size_x > 0) else (part_sx + 2 * cfg.margin_x))
+        fy = float(cfg.fixed_size_y if (cfg.fixed_size_y and cfg.fixed_size_y > 0) else (part_sy + 2 * cfg.margin_y))
+        fz = float(cfg.fixed_size_z if (cfg.fixed_size_z and cfg.fixed_size_z > 0) else (part_sz + cfg.margin_z_top + cfg.margin_z_bottom))
+
+        cx = 0.5 * (bmin[0] + bmax[0]) + off_x
+        cy = 0.5 * (bmin[1] + bmax[1]) + off_y
+        z_top = float(bmax[2] + cfg.margin_z_top + off_z)
+        z_bot = z_top - fz
+
+        stock_min = np.array([cx - fx / 2.0, cy - fy / 2.0, z_bot])
+        stock_max = np.array([cx + fx / 2.0, cy + fy / 2.0, z_top])
+        return Stock(kind=StockKind.BOX, bounds_min=stock_min, bounds_max=stock_max)
+
+    else:
+        # relative_box
+        stock_min = np.array([
+            bmin[0] - cfg.margin_x + off_x,
+            bmin[1] - cfg.margin_y + off_y,
+            bmin[2] - cfg.margin_z_bottom + off_z,
+        ])
+        stock_max = np.array([
+            bmax[0] + cfg.margin_x + off_x,
+            bmax[1] + cfg.margin_y + off_y,
+            bmax[2] + cfg.margin_z_top + off_z,
+        ])
+        return Stock(kind=StockKind.BOX, bounds_min=stock_min, bounds_max=stock_max)
 
 
 def _shape_to_demo_cad_model(name: str, shape: Shape, desc: str = "Imported Model") -> DemoCADModel:
@@ -381,16 +462,35 @@ def orient_model(request: Request, req: OrientModelRequest):
 
 @router.get("/setups", response_model=SetupsListResponse)
 def get_setups(request: Request):
-    """List all configured machining setups."""
+    """List all configured machining setups with calculated transformed bounds."""
     sess = _get_session(request)
     items = []
     for s in sess.setups:
+        rot_mat = _euler_to_matrix(*s.rotation_deg)
+        if sess.imported_model:
+            shape_in_setup = sess.imported_model.shape.transformed(rot_mat)
+            bmin, bmax = shape_in_setup.bounding_box()
+        elif sess.raw_mesh and sess.raw_mesh.bounding_box:
+            bmin = sess.raw_mesh.bounds_min
+            bmax = sess.raw_mesh.bounds_max
+        else:
+            bmin = [0.0, 0.0, 0.0]
+            bmax = [100.0, 60.0, 25.0]
+
+        cfg = s.stock_cfg or StockConfig(work_offset=s.work_offset)
+        stock = _create_stock_from_config(cfg, bmin, bmax)
+        s_min = [float(x) for x in stock.bounds_min]
+        s_max = [float(x) for x in stock.bounds_max]
+        s_size = [float(s_max[i] - s_min[i]) for i in range(3)]
+        stk_bounds = BoundingBox(min=s_min, max=s_max, size=s_size)
+
         items.append(SetupItem(
             id=s.id,
             name=s.name,
             work_offset=s.work_offset,
             rotation_deg=s.rotation_deg,
-            stock=s.stock_cfg,
+            stock=cfg,
+            stock_bounds=stk_bounds,
             feature_ids=s.feature_ids,
             operations_count=s.operations_count,
             is_active=(s.id == sess.active_setup_id),
@@ -423,6 +523,30 @@ def add_setup(request: Request, req: AddSetupRequest):
     return get_setups(request)
 
 
+@router.post("/setups/update/{setup_id}", response_model=SetupsListResponse)
+def update_setup(request: Request, setup_id: str, req: UpdateSetupRequest):
+    """Update setup parameters such as name, work offset, or stock configuration."""
+    sess = _get_session(request)
+    target = None
+    for s in sess.setups:
+        if s.id == setup_id:
+            target = s
+            break
+    if not target:
+        raise HTTPException(status_code=404, detail=f"Setup {setup_id} not found")
+
+    if req.name is not None:
+        target.name = req.name
+    if req.work_offset is not None:
+        target.work_offset = req.work_offset
+    if req.rotation_deg is not None:
+        target.rotation_deg = req.rotation_deg
+    if req.stock is not None:
+        target.stock_cfg = req.stock
+
+    return get_setups(request)
+
+
 @router.post("/setups/active/{setup_id}", response_model=SetupsListResponse)
 def set_active_setup(request: Request, setup_id: str):
     """Sets the active setup."""
@@ -443,6 +567,86 @@ def delete_setup(request: Request, setup_id: str):
     sess.setups = [s for s in sess.setups if s.id != setup_id]
     if sess.active_setup_id == setup_id:
         sess.active_setup_id = sess.setups[0].id
+    return get_setups(request)
+
+
+@router.post("/setups/auto-generate", response_model=SetupsListResponse)
+def auto_generate_setups(request: Request):
+    """Automatically analyzes 3D model geometry to configure required multi-axis setups (Top, Bottom, Sides)."""
+    sess = _get_session(request)
+    setups: list[SetupConfig] = [
+        SetupConfig(id="setup_001", name="Setup 1 - Top Milling", work_offset="G54", rotation_deg=[0.0, 0.0, 0.0])
+    ]
+
+    offsets = ["G55", "G56", "G57", "G58", "G59"]
+    offset_idx = 0
+
+    if sess.imported_model is not None:
+        shape = sess.imported_model.shape
+        faces = shape.faces()
+
+        has_side_x = False
+        has_side_y = False
+
+        for f in faces:
+            if f.surface.kind is SurfaceKind.CYLINDER and f.surface.axis is not None:
+                axis = f.surface.axis / max(float(np.linalg.norm(f.surface.axis)), 1e-12)
+                if abs(axis[2]) < 0.3:
+                    if abs(axis[0]) >= abs(axis[1]):
+                        has_side_x = True
+                    else:
+                        has_side_y = True
+            elif f.surface.kind is SurfaceKind.PLANE and f.oriented_normal is not None:
+                norm = f.oriented_normal
+                if (abs(norm[0]) > 0.85 or abs(norm[1]) > 0.85) and f.area > 150.0:
+                    # Significant side face
+                    if abs(norm[0]) > abs(norm[1]):
+                        has_side_x = True
+                    else:
+                        has_side_y = True
+
+        # Standard 2-sided part: always include Bottom Flip (G55)
+        if offset_idx < len(offsets):
+            setups.append(SetupConfig(
+                id=f"setup_{len(setups)+1:03d}",
+                name="Setup 2 - Bottom Flip",
+                work_offset=offsets[offset_idx],
+                rotation_deg=[180.0, 0.0, 0.0]
+            ))
+            offset_idx += 1
+
+        if has_side_x and offset_idx < len(offsets):
+            setups.append(SetupConfig(
+                id=f"setup_{len(setups)+1:03d}",
+                name=f"Setup {len(setups)+1} - Side Milling (+X)",
+                work_offset=offsets[offset_idx],
+                rotation_deg=[0.0, 90.0, 0.0]
+            ))
+            offset_idx += 1
+
+        if has_side_y and offset_idx < len(offsets):
+            setups.append(SetupConfig(
+                id=f"setup_{len(setups)+1:03d}",
+                name=f"Setup {len(setups)+1} - End Face (+Y)",
+                work_offset=offsets[offset_idx],
+                rotation_deg=[90.0, 0.0, 0.0]
+            ))
+            offset_idx += 1
+    else:
+        # Fallback for demo model
+        setups.append(SetupConfig(
+            id="setup_002",
+            name="Setup 2 - Bottom Flip",
+            work_offset="G55",
+            rotation_deg=[180.0, 0.0, 0.0]
+        ))
+
+    sess.setups = setups
+    sess.active_setup_id = setups[0].id
+    sess.features = []
+    sess.planned_ops = []
+    sess.toolpaths = []
+
     return get_setups(request)
 
 
@@ -547,8 +751,25 @@ def auto_suggest_tool(request: Request, req: AutoSuggestToolRequest):
     """Auto-generate a fitting tool for an unmachined feature and add it to library."""
     sess = _get_session(request)
     feature = next((f for f in sess.features if f.id == req.feature_id), None)
-    dia = req.diameter or (feature.diameter if feature else 1.0) or 1.0
-    ttype = req.tool_type or ("drill" if feature and feature.type in (FeatureType.HOLE, FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE, FeatureType.COUNTERBORE) else "flat_endmill")
+    
+    if req.tool_type:
+        ttype = req.tool_type
+    elif feature and feature.type in (FeatureType.HOLE, FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE):
+        ttype = "drill"
+    else:
+        ttype = "flat_endmill"
+
+    if req.diameter is not None and req.diameter > 0:
+        dia = float(req.diameter)
+    elif feature:
+        if ttype == "drill":
+            dia = float(feature.diameter or 1.0)
+        else:
+            dia = max(0.2, round((feature.diameter or 1.0) * 0.7, 2))
+            if feature.diameter and dia >= feature.diameter:
+                dia = round(feature.diameter * 0.5, 2)
+    else:
+        dia = 1.0
     
     depth = feature.depth if (feature and feature.depth) else 5.0
     add_req = AddToolRequest(
@@ -556,7 +777,7 @@ def auto_suggest_tool(request: Request, req: AutoSuggestToolRequest):
         diameter=round(float(dia), 2),
         flute_length=round(max(depth * 1.3, 5.0), 1),
         overall_length=round(max(depth * 2.5, 35.0), 1),
-        flutes=2,
+        flutes=2 if ttype == "drill" else 3,
         material="carbide"
     )
     return add_custom_tool(request, add_req)
@@ -710,20 +931,9 @@ def _build_context_and_setups(sess: SessionState, stock_cfg: StockConfig):
             bmax = sess.raw_mesh.bounds_max if sess.raw_mesh else [100, 60, 25]
 
         cfg = sc.stock_cfg
-        off_x = getattr(cfg, "offset_x", 0.0) or 0.0
-        off_y = getattr(cfg, "offset_y", 0.0) or 0.0
-        off_z = getattr(cfg, "offset_z", 0.0) or 0.0
-        stock_min = np.array([
-            bmin[0] - cfg.margin_x + off_x,
-            bmin[1] - cfg.margin_y + off_y,
-            bmin[2] - cfg.margin_z_bottom + off_z,
-        ])
-        stock_max = np.array([
-            bmax[0] + cfg.margin_x + off_x,
-            bmax[1] + cfg.margin_y + off_y,
-            bmax[2] + cfg.margin_z_top + off_z,
-        ])
-        stock = Stock(kind=StockKind.BOX, bounds_min=stock_min, bounds_max=stock_max)
+        stock = _create_stock_from_config(cfg, bmin, bmax)
+        stock_min = stock.bounds_min
+        stock_max = stock.bounds_max
 
         # Clamping / Fixture setup modeling
         fixtures: list[Fixture] = []
@@ -875,6 +1085,7 @@ def generate_toolpaths(request: Request, req: GenerateToolpathsRequest):
         total_cut_len = 0.0
         total_rapid_len = 0.0
         prev_remaining_stock = None
+        prev_setup = None
 
         for s in setups:
             setup_ops = [op for op in sess.planned_ops if op.notes.get("setup_id") == s.id]
@@ -893,8 +1104,16 @@ def generate_toolpaths(request: Request, req: GenerateToolpathsRequest):
 
             dims = s.stock.bounds_max - s.stock.bounds_min
             resolution = max(0.5, min(dims) / 50.0)
-            if prev_remaining_stock is not None:
-                stock_voxels = prev_remaining_stock
+            if prev_remaining_stock is not None and prev_setup is not None:
+                M_curr = s.model_to_setup
+                M_prev = prev_setup.model_to_setup
+                try:
+                    T_prev_to_curr = M_curr @ np.linalg.inv(M_prev)
+                except np.linalg.LinAlgError:
+                    T_prev_to_curr = np.eye(4)
+                stock_voxels = prev_remaining_stock.transformed(
+                    T_prev_to_curr, s.stock.bounds_min, s.stock.bounds_max, resolution
+                )
             else:
                 stock_voxels = VoxelStock.from_bounds(s.stock.bounds_min, s.stock.bounds_max, resolution)
 
@@ -920,6 +1139,7 @@ def generate_toolpaths(request: Request, req: GenerateToolpathsRequest):
                 total_rapid_len += tp.rapid_length()
 
             prev_remaining_stock = stock_voxels
+            prev_setup = s
 
         sess.toolpaths = all_toolpaths
 
@@ -973,6 +1193,44 @@ def generate_gcode(request: Request, req: PostProcessRequest):
         if not sess.toolpaths:
             generate_toolpaths(request, GenerateToolpathsRequest(stock=sess.stock_config))
 
+        unique_setup_ids = []
+        for tp in sess.toolpaths:
+            sid = tp.metadata.get("setup_id", "setup_001")
+            if sid not in unique_setup_ids:
+                unique_setup_ids.append(sid)
+
+        # If separate_files requested, return per-setup data
+        if req.separate_files:
+            from .models import PostProcessPerSetupResponse
+            setups_data = {}
+            total_time = 0.0
+            for i, sid in enumerate(unique_setup_ids):
+                setup_tps = [tp for tp in sess.toolpaths if tp.metadata.get("setup_id", "setup_001") == sid]
+                if not setup_tps:
+                    continue
+                matching_setup = next((s for s in sess.setups if s.id == sid), None)
+                wo = matching_setup.work_offset if matching_setup else req.work_offset
+                sname = matching_setup.name if matching_setup else f"Setup {i+1}"
+                post = get_post_processor(controller=req.controller, work_offset=wo)
+                result = post.post_process(setup_tps, program_name=f"{req.program_name}_{sid}")
+                setups_data[sid] = {
+                    "gcode": result.gcode,
+                    "line_count": result.line_count,
+                    "cycle_time_seconds": result.total_time_seconds,
+                    "work_offset": wo,
+                    "name": sname,
+                    "tool_changes": result.tool_changes,
+                    "rapid_dist_mm": result.total_rapid_dist_mm,
+                    "cut_dist_mm": result.total_cut_dist_mm,
+                }
+                total_time += result.total_time_seconds
+            return PostProcessPerSetupResponse(
+                controller=req.controller,
+                setups=setups_data,
+                total_cycle_time_seconds=total_time,
+            )
+
+        # Original combined G-code logic
         gcode_blocks = []
         total_time = 0.0
         rapid_time = 0.0
@@ -982,12 +1240,7 @@ def generate_gcode(request: Request, req: PostProcessRequest):
         all_tools = []
         setups_processed = []
 
-        unique_setup_ids = []
-        for tp in sess.toolpaths:
-            sid = tp.metadata.get("setup_id", "setup_001")
-            if sid not in unique_setup_ids:
-                unique_setup_ids.append(sid)
-
+        per_setup_data = {}
         for i, sid in enumerate(unique_setup_ids):
             setup_tps = [tp for tp in sess.toolpaths if tp.metadata.get("setup_id", "setup_001") == sid]
             if not setup_tps:
@@ -1001,8 +1254,31 @@ def generate_gcode(request: Request, req: PostProcessRequest):
             post = get_post_processor(controller=req.controller, work_offset=wo)
             result = post.post_process(setup_tps, program_name=f"{req.program_name}_{sid}")
 
+            per_setup_data[sid] = {
+                "gcode": result.gcode,
+                "line_count": result.line_count,
+                "cycle_time_seconds": result.total_time_seconds,
+                "work_offset": wo,
+                "name": sname,
+                "tool_changes": result.tool_changes,
+                "rapid_dist_mm": result.total_rapid_dist_mm,
+                "cut_dist_mm": result.total_cut_dist_mm,
+            }
+
             if i > 0:
-                gcode_blocks.append(f"\n; ==========================================\n; (--- {sname.upper()} - FLIP / RE-FIXTURE PART ---)\n; ==========================================\nM00 (Pause for part re-fixturing / setup flip)\n")
+                retract_cmd = "G53 G00 Z0." if req.controller in ("fanuc", "haas") else "G28 G91 Z0.\nG90"
+                msg_cmd = f"(MSG, FLIP PART - LOAD {sname.upper()} [{wo}])" if req.controller == "haas" else f"({sname.upper()} - FLIP / RE-FIXTURE PART)"
+                gcode_blocks.append(
+                    f"\n; ==========================================\n"
+                    f"; (--- {sname.upper()} - FLIP / RE-FIXTURE PART ---)\n"
+                    f"; ==========================================\n"
+                    f"M05 (Spindle Stop)\n"
+                    f"M09 (Coolant Off)\n"
+                    f"{retract_cmd}\n"
+                    f"{msg_cmd}\n"
+                    f"M00 (Program Stop - Operator Flip/Reclamp)\n"
+                    f"{wo} (Activate Setup Work Offset)\n"
+                )
 
             gcode_blocks.append(result.gcode)
             total_time += result.total_time_seconds
@@ -1029,14 +1305,224 @@ def generate_gcode(request: Request, req: PostProcessRequest):
             tool_changes=all_tools,
             work_offset=req.work_offset,
             setups=setups_processed,
+            per_setup=per_setup_data,
         )
     except CamError as e:
         raise HTTPException(status_code=400, detail=f"[{e.code}] {e.message}")
 
 
+@router.get("/gcode/download/{setup_id}")
+def download_setup_gcode(
+    request: Request,
+    setup_id: str,
+    controller: str = "haas",
+    program_name: Optional[str] = None,
+):
+    """Generates and downloads the G-code file for a specific setup."""
+    sess = _get_session(request)
+    if not sess.toolpaths:
+        generate_toolpaths(request, GenerateToolpathsRequest(stock=sess.stock_config))
+
+    target_setup = next((s for s in sess.setups if s.id == setup_id), None)
+    if not target_setup:
+        raise HTTPException(status_code=404, detail=f"Setup {setup_id} not found")
+
+    setup_tps = [tp for tp in sess.toolpaths if tp.metadata.get("setup_id", "setup_001") == setup_id]
+
+    prog_name = program_name or f"{sess.model_name.replace(' ', '_')}_{target_setup.name.replace(' ', '_')}"
+    post = get_post_processor(controller=controller, work_offset=target_setup.work_offset)
+    result = post.post_process(setup_tps, program_name=prog_name)
+
+    safe_name = f"{sess.model_name.replace(' ', '_')}_{target_setup.name.replace(' ', '_')}_{target_setup.work_offset}.nc"
+    return Response(
+        content=result.gcode,
+        media_type="text/plain",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+    )
+
+
+@router.get("/export-package")
+def export_cam_package(
+    request: Request,
+    controller: str = "haas",
+    program_name: Optional[str] = None,
+):
+    """Generates a complete multi-setup production package (ZIP) containing separate setup NC files,
+    a master combined program, per-setup setup sheets, and the master routing sheet."""
+    sess = _get_session(request)
+    if not sess.toolpaths:
+        generate_toolpaths(request, GenerateToolpathsRequest(stock=sess.stock_config))
+
+    ctx, setups = _build_context_and_setups(sess, sess.stock_config)
+    base_name = program_name or sess.model_name.replace(" ", "_")
+
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        per_setup_results = {}
+        for idx, s in enumerate(setups):
+            setup_tps = [tp for tp in sess.toolpaths if tp.metadata.get("setup_id") == s.id]
+            post = get_post_processor(controller=controller, work_offset=s.work_offset.value)
+            s_prog_name = f"{base_name}_OP{(idx+1)*10}_{s.work_offset.value}"
+            res = post.post_process(setup_tps, program_name=s_prog_name)
+            per_setup_results[s.id] = {
+                "cycle_time_seconds": res.total_time_seconds,
+                "gcode": res.gcode,
+            }
+
+            nc_filename = f"{s_prog_name}.nc"
+            zip_file.writestr(f"NC_Programs/{nc_filename}", res.gcode)
+
+            # Per-setup sheet
+            from ..setup_sheet import generate_setup_sheet, format_setup_sheet
+            s_ops = [op for op in sess.planned_ops if op.notes.get("setup_id") == s.id]
+            s_feats = [f for f in sess.features if f.notes.get("setup_id") == s.id]
+            sheet = generate_setup_sheet(
+                program_name=s_prog_name,
+                part_name=sess.model_name,
+                planning_ctx=ctx,
+                setup=s,
+                features=s_feats,
+                operations=s_ops,
+                toolpaths=setup_tps,
+                post_result=res,
+            )
+            sheet_txt = format_setup_sheet(sheet)
+            zip_file.writestr(f"Setup_Sheets/SETUP_SHEET_{s.id}_{s.work_offset.value}.txt", sheet_txt)
+
+        # Master Combined NC program
+        combined_req = PostProcessRequest(controller=controller, program_name=base_name, separate_files=False)
+        combined_res = generate_gcode(request, combined_req)
+        zip_file.writestr(f"NC_Programs/{base_name}_MASTER_ALL_SETUPS.nc", combined_res.gcode)
+
+        # Master Routing Sheet
+        from ..setup_sheet import generate_master_routing_sheet, format_master_routing_sheet
+        master_sheet = generate_master_routing_sheet(
+            program_name=f"{base_name}_MASTER",
+            part_name=sess.model_name,
+            planning_ctx=ctx,
+            setups=setups,
+            all_features=sess.features,
+            all_operations=sess.planned_ops,
+            all_toolpaths=sess.toolpaths,
+            per_setup_results=per_setup_results,
+        )
+        master_txt = format_master_routing_sheet(master_sheet)
+        zip_file.writestr("MASTER_ROUTING_SHEET.txt", master_txt)
+
+    zip_buffer.seek(0)
+    zip_bytes = zip_buffer.getvalue()
+    zip_name = f"{base_name}_CAM_Package.zip"
+
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+    )
+
+
+@router.get("/setup-sheet-master")
+def get_master_setup_sheet(request: Request):
+    """Generates the consolidated master routing sheet across all setups."""
+    from ..setup_sheet import generate_master_routing_sheet, format_master_routing_sheet
+    sess = _get_session(request)
+
+    if not sess.raw_mesh:
+        raise HTTPException(status_code=400, detail="No model loaded")
+    if not sess.planned_ops:
+        plan_operations(request, PlanOpsRequest(stock=sess.stock_config))
+    if not sess.toolpaths:
+        generate_toolpaths(request, GenerateToolpathsRequest(stock=sess.stock_config))
+
+    ctx, setups = _build_context_and_setups(sess, sess.stock_config)
+    base_name = sess.model_name.replace(" ", "_")
+
+    per_setup_results = {}
+    for s in setups:
+        setup_tps = [tp for tp in sess.toolpaths if tp.metadata.get("setup_id") == s.id]
+        post = get_post_processor(controller=sess.machine.controller or "haas", work_offset=s.work_offset.value)
+        res = post.post_process(setup_tps, program_name=f"{base_name}_{s.id}")
+        per_setup_results[s.id] = {"cycle_time_seconds": res.total_time_seconds}
+
+    master_sheet = generate_master_routing_sheet(
+        program_name=f"{base_name}_MASTER",
+        part_name=sess.model_name,
+        planning_ctx=ctx,
+        setups=setups,
+        all_features=sess.features,
+        all_operations=sess.planned_ops,
+        all_toolpaths=sess.toolpaths,
+        per_setup_results=per_setup_results,
+    )
+
+    return {
+        "text": format_master_routing_sheet(master_sheet),
+        "sheet": {
+            "program_name": master_sheet.program_name,
+            "part_name": master_sheet.part_name,
+            "material": master_sheet.material,
+            "machine": master_sheet.machine,
+            "total_cycle_time": master_sheet.total_cycle_time,
+            "setup_summaries": master_sheet.setup_summaries,
+            "consolidated_tools": master_sheet.consolidated_tools,
+            "notes": master_sheet.notes,
+        },
+    }
+
+
+@router.get("/setup-sheet/{setup_id}")
+def get_setup_sheet_for_setup(request: Request, setup_id: str):
+    """Generates a setup sheet for a specific setup."""
+    from ..setup_sheet import generate_setup_sheet, format_setup_sheet
+    sess = _get_session(request)
+
+    if not sess.raw_mesh:
+        raise HTTPException(status_code=400, detail="No model loaded")
+    if not sess.planned_ops:
+        plan_operations(request, PlanOpsRequest(stock=sess.stock_config))
+    if not sess.toolpaths:
+        generate_toolpaths(request, GenerateToolpathsRequest(stock=sess.stock_config))
+
+    ctx, setups = _build_context_and_setups(sess, sess.stock_config)
+    setup = next((s for s in setups if s.id == setup_id), None)
+    if not setup:
+        raise HTTPException(status_code=404, detail=f"Setup {setup_id} not found")
+
+    setup_tps = [tp for tp in sess.toolpaths if tp.metadata.get("setup_id") == setup_id]
+    s_ops = [op for op in sess.planned_ops if op.notes.get("setup_id") == setup_id]
+    s_feats = [f for f in sess.features if f.notes.get("setup_id") == setup_id]
+
+    post = get_post_processor(controller=sess.machine.controller or "haas", work_offset=setup.work_offset.value)
+    post_result = post.post_process(setup_tps, program_name=f"{sess.model_name.replace(' ', '_')}_{setup.id}")
+
+    sheet = generate_setup_sheet(
+        program_name=f"{sess.model_name.upper().replace(' ', '_')}_{setup.id}",
+        part_name=sess.model_name,
+        planning_ctx=ctx,
+        setup=setup,
+        features=s_feats,
+        operations=s_ops,
+        toolpaths=setup_tps,
+        post_result=post_result,
+    )
+
+    return {"text": format_setup_sheet(sheet), "sheet": {
+        "program_name": sheet.program_name,
+        "part_name": sheet.part_name,
+        "material": sheet.material,
+        "machine": sheet.machine,
+        "setup_name": sheet.setup_name,
+        "work_offset": sheet.work_offset,
+        "stock_dimensions": sheet.stock_dimensions,
+        "tool_count": len(sheet.tool_list),
+        "operation_count": len(sheet.operations),
+        "estimated_cycle_time": sheet.estimated_cycle_time,
+        "notes": sheet.notes,
+    }}
+
+
 @router.get("/setup-sheet")
 def get_setup_sheet(request: Request):
-    """Generates a setup sheet for shop floor documentation."""
+    """Generates a setup sheet for shop floor documentation (primary setup)."""
     from ..setup_sheet import generate_setup_sheet, format_setup_sheet
     sess = _get_session(request)
 

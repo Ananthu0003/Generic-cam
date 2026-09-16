@@ -1,7 +1,7 @@
 [project]
-name = "generic-cam"
+name = "vexcam"
 version = "0.1.0"
-description = "Generic geometry-driven CAM toolpath planning and G-code generation from STEP files"
+description = "VexCAM geometry-driven CAM toolpath planning and G-code generation from STEP files"
 requires-python = ">=3.10"
 dependencies = [
     "numpy",

@@ -74,7 +74,7 @@ def generate_setup_sheet(
         units="mm",
         setup_name=setup.name,
         work_offset=setup.work_offset.value,
-        stock_dimensions=f"{stock_dims[0]:.1f} x {stock_dims[1]:.1f} x {stock_dims[2]:.1f} mm",
+        stock_dimensions=stock.dimension_description(),
         stock_material=planning_ctx.material.name,
         tool_list=tool_list,
         operations=op_list,
@@ -88,7 +88,7 @@ def format_setup_sheet(sheet: SetupSheet) -> str:
     """Format a SetupSheet into a human-readable text report."""
     lines = []
     lines.append("=" * 70)
-    lines.append("SETUP SHEET - GENERIC CAM STUDIO")
+    lines.append("SETUP SHEET - VEXCAM STUDIO")
     lines.append("=" * 70)
     lines.append("")
     lines.append(f"Program Name:    {sheet.program_name}")
@@ -200,3 +200,129 @@ def _build_operation_list(operations, toolpaths) -> list[dict]:
             "estimated_time": est_time,
         })
     return op_list
+
+
+@dataclass
+class MasterRoutingSheet:
+    """Consolidated multi-setup job routing sheet for shop floor dispatch."""
+    program_name: str
+    part_name: str
+    material: str
+    machine: str
+    controller: str
+    units: str
+    total_cycle_time: float
+    generated_at: str
+    setup_summaries: list[dict]
+    consolidated_tools: list[dict]
+    notes: list[str]
+
+
+def generate_master_routing_sheet(
+    program_name: str,
+    part_name: str,
+    planning_ctx: PlanningContext,
+    setups: list[Setup],
+    all_features: list[MachiningFeature],
+    all_operations: list[PlannedOperation],
+    all_toolpaths: list[Toolpath],
+    per_setup_results: Optional[dict] = None,
+) -> MasterRoutingSheet:
+    """Generate a master multi-setup job routing overview."""
+    setup_summaries = []
+    total_time = 0.0
+
+    for idx, s in enumerate(setups):
+        s_ops = [op for op in all_operations if op.notes.get("setup_id") == s.id]
+        s_tps = [tp for tp in all_toolpaths if tp.metadata.get("setup_id") == s.id]
+        s_time = 0.0
+        if per_setup_results and s.id in per_setup_results:
+            s_time = per_setup_results[s.id].get("cycle_time_seconds", 0.0)
+        else:
+            s_time = sum(tp.cutting_length() / max(getattr(tp, 'feed', 500.0) or 500.0, 10.0) * 60.0 for tp in s_tps)
+        total_time += s_time
+
+        used_tools = []
+        for op in s_ops:
+            if op.tool.id not in used_tools:
+                used_tools.append(op.tool.id)
+
+        clamp_desc = ", ".join(f.name for f in s.fixtures) if s.fixtures else "Standard Vise"
+        setup_summaries.append({
+            "sequence": f"OP{(idx + 1) * 10}",
+            "setup_id": s.id,
+            "name": s.name,
+            "work_offset": s.work_offset.value,
+            "workholding": clamp_desc,
+            "stock_dimensions": s.stock.dimension_description(),
+            "operations_count": len(s_ops),
+            "tools_count": len(used_tools),
+            "tools": used_tools,
+            "cycle_time_seconds": s_time,
+        })
+
+    consolidated_tools = _build_tool_list(planning_ctx.tools, all_operations, all_toolpaths)
+    notes = [
+        "Multi-setup manufacturing package - verify datum zero at each operation step",
+        "Clean chip buildup and deburr locating faces before re-clamping in subsequent setups",
+    ]
+
+    return MasterRoutingSheet(
+        program_name=program_name,
+        part_name=part_name,
+        material=planning_ctx.material.name,
+        machine=planning_ctx.machine.name,
+        controller=planning_ctx.machine.controller,
+        units="mm",
+        total_cycle_time=total_time,
+        generated_at=datetime.now().isoformat(),
+        setup_summaries=setup_summaries,
+        consolidated_tools=consolidated_tools,
+        notes=notes,
+    )
+
+
+def format_master_routing_sheet(sheet: MasterRoutingSheet) -> str:
+    """Format MasterRoutingSheet into a human-readable text routing report."""
+    lines = []
+    lines.append("=" * 78)
+    lines.append("MULTI-SETUP MASTER ROUTING SHEET - VEXCAM STUDIO")
+    lines.append("=" * 78)
+    lines.append("")
+    lines.append(f"Program Master:  {sheet.program_name}")
+    lines.append(f"Part Name:       {sheet.part_name}")
+    lines.append(f"Material:        {sheet.material}")
+    lines.append(f"Target Machine:  {sheet.machine} ({sheet.controller})")
+    lines.append(f"Total Job Time:  {sheet.total_cycle_time:.1f}s ({sheet.total_cycle_time / 60:.1f} min)")
+    lines.append(f"Generated:       {sheet.generated_at}")
+    lines.append("")
+    lines.append("-" * 78)
+    lines.append("MANUFACTURING SETUP SEQUENCE")
+    lines.append("-" * 78)
+    lines.append(f"{'Step':<8} {'WCS':<6} {'Setup Name':<28} {'Workholding':<18} {'Ops':<5} {'Time (s)'}")
+    lines.append("-" * 78)
+    for s in sheet.setup_summaries:
+        lines.append(
+            f"{s['sequence']:<8} {s['work_offset']:<6} {s['name']:<28} "
+            f"{s['workholding'][:17]:<18} {s['operations_count']:<5} {s['cycle_time_seconds']:<8.1f}"
+        )
+    lines.append("")
+    lines.append("-" * 78)
+    lines.append("CONSOLIDATED TOOLING LIST (ALL SETUPS)")
+    lines.append("-" * 78)
+    lines.append(f"{'T#':<5} {'Type':<20} {'Dia (mm)':<10} {'Flute (mm)':<12} {'Description'}")
+    lines.append("-" * 78)
+    for tool in sheet.consolidated_tools:
+        lines.append(
+            f"{tool['tool_number']:<5} {tool['type']:<20} {tool['diameter']:<10.2f} "
+            f"{tool['flute_length']:<12.1f} {tool['description']}"
+        )
+    lines.append("")
+    lines.append("-" * 78)
+    lines.append("OPERATOR NOTES & QUALITY CONTROL")
+    lines.append("-" * 78)
+    for note in sheet.notes:
+        lines.append(f"  - {note}")
+    lines.append("=" * 78)
+    return "\n".join(lines)
+

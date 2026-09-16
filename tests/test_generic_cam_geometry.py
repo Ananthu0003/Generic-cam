@@ -1,4 +1,4 @@
-"""Comprehensive geometry-driven regression and acceptance tests for Generic CAM architecture.
+"""Comprehensive geometry-driven regression and acceptance tests for VexCAM architecture.
 
 Tests:
 1. Feature Recognition (Through hole, Blind hole, Counterbore, Boss, Pocket, Slot, Step, Facing)

@@ -1,4 +1,4 @@
-"""Pydantic request and response schemas for Generic-CAM API."""
+"""Pydantic request and response schemas for VexCAM API."""
 
 from __future__ import annotations
 
@@ -93,6 +93,7 @@ class MachineItem(BaseModel):
 
 
 class StockConfig(BaseModel):
+    stock_mode: str = "relative_box"   # "relative_box", "fixed_box", "cylinder"
     margin_x: float = 5.0
     margin_y: float = 5.0
     margin_z_top: float = 1.0
@@ -100,6 +101,18 @@ class StockConfig(BaseModel):
     offset_x: float = 0.0
     offset_y: float = 0.0
     offset_z: float = 0.0
+    # Fixed size billet parameters
+    fixed_size_x: Optional[float] = None
+    fixed_size_y: Optional[float] = None
+    fixed_size_z: Optional[float] = None
+    # Cylindrical stock parameters
+    cylinder_diameter: Optional[float] = None
+    cylinder_length: Optional[float] = None
+    cylinder_axis: str = "Z"           # "Z", "X", "Y"
+    cylinder_margin_radial: float = 2.0
+    cylinder_margin_axial_top: float = 1.0
+    cylinder_margin_axial_bot: float = 3.0
+    # Material and clamping
     material: str = "aluminum_6061"
     work_offset: str = "G54"
     thread_pitch: float = 1.0
@@ -122,6 +135,7 @@ class SetupItem(BaseModel):
     tool_axis: list[float] = Field(default_factory=lambda: [0.0, 0.0, 1.0])
     rotation_deg: list[float] = Field(default_factory=lambda: [0.0, 0.0, 0.0])
     stock: StockConfig = Field(default_factory=StockConfig)
+    stock_bounds: Optional[BoundingBox] = None
     feature_ids: list[str] = Field(default_factory=list)
     operations_count: int = 0
     is_active: bool = False
@@ -131,6 +145,13 @@ class AddSetupRequest(BaseModel):
     name: str
     work_offset: str = "G55"
     preset: Optional[str] = "flip_x_180"  # "top", "flip_x_180", "flip_y_180", "side_x_90", "side_y_90"
+    rotation_deg: Optional[list[float]] = None
+    stock: Optional[StockConfig] = None
+
+
+class UpdateSetupRequest(BaseModel):
+    name: Optional[str] = None
+    work_offset: Optional[str] = None
     rotation_deg: Optional[list[float]] = None
     stock: Optional[StockConfig] = None
 
@@ -158,6 +179,13 @@ class MultiSetupPostProcessResponse(BaseModel):
     total_cut_dist_mm: float
     tool_changes: list[str]
     setups: list[str]
+
+
+class PostProcessPerSetupResponse(BaseModel):
+    """Separate G-code file per setup."""
+    controller: str
+    setups: dict[str, dict]  # setup_id -> {gcode, line_count, cycle_time, work_offset, name}
+    total_cycle_time_seconds: float
 
 
 class PlanOpsRequest(BaseModel):
@@ -235,6 +263,7 @@ class PostProcessRequest(BaseModel):
     work_offset: str = "G54"
     program_name: str = "PART_01"
     all_setups: bool = True
+    separate_files: bool = False  # If true, return separate G-code per setup
 
 
 class PostProcessResponse(BaseModel):
@@ -249,3 +278,5 @@ class PostProcessResponse(BaseModel):
     tool_changes: list[str]
     work_offset: str
     setups: Optional[list[str]] = None
+    per_setup: Optional[dict[str, dict]] = None
+

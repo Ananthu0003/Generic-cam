@@ -41,6 +41,9 @@ class SurfaceData:
     radius: Optional[float] = None           # cylinder radius
     semi_angle: Optional[float] = None       # cone semi-angle (rad)
     ref_radius: Optional[float] = None       # cone reference radius
+    u_min: Optional[float] = None            # first U parameter (radians for cylinder/cone/torus)
+    u_max: Optional[float] = None            # last U parameter
+    u_span: Optional[float] = None           # angular / parametric span in U
 
 
 @dataclass
@@ -222,42 +225,52 @@ class Shape:
         adaptor = BRepAdaptor_Surface(occ_face)
         st = adaptor.GetType()
 
-        sd = SurfaceData(kind=SurfaceKind.OTHER)
+        u_min = float(adaptor.FirstUParameter())
+        u_max = float(adaptor.LastUParameter())
+        u_span = float(u_max - u_min)
+
+        sd = SurfaceData(kind=SurfaceKind.OTHER, u_min=u_min, u_max=u_max, u_span=u_span)
         if st == GeomAbs_Plane:
             pln = adaptor.Plane()
             loc, ax = pln.Location(), pln.Axis().Direction()
             sd = SurfaceData(kind=SurfaceKind.PLANE,
                              point_on=np.array([loc.X(), loc.Y(), loc.Z()]),
-                             normal=np.array([ax.X(), ax.Y(), ax.Z()]))
+                             normal=np.array([ax.X(), ax.Y(), ax.Z()]),
+                             u_min=u_min, u_max=u_max, u_span=u_span)
         elif st == GeomAbs_Cylinder:
             cyl = adaptor.Cylinder()
             loc, ax = cyl.Location(), cyl.Axis().Direction()
             sd = SurfaceData(kind=SurfaceKind.CYLINDER,
                              point_on=np.array([loc.X(), loc.Y(), loc.Z()]),
                              axis=np.array([ax.X(), ax.Y(), ax.Z()]),
-                             radius=cyl.Radius())
+                             radius=cyl.Radius(),
+                             u_min=u_min, u_max=u_max, u_span=u_span)
         elif st == GeomAbs_Cone:
             cone = adaptor.Cone()
             loc, ax = cone.Location(), cone.Axis().Direction()
             sd = SurfaceData(kind=SurfaceKind.CONE,
                              point_on=np.array([loc.X(), loc.Y(), loc.Z()]),
                              axis=np.array([ax.X(), ax.Y(), ax.Z()]),
-                             semi_angle=cone.SemiAngle(), ref_radius=cone.RefRadius())
+                             semi_angle=cone.SemiAngle(), ref_radius=cone.RefRadius(),
+                             u_min=u_min, u_max=u_max, u_span=u_span)
         elif st == GeomAbs_Sphere:
             sph = adaptor.Sphere()
             loc = sph.Location()
             sd = SurfaceData(kind=SurfaceKind.SPHERE,
                              point_on=np.array([loc.X(), loc.Y(), loc.Z()]),
-                             radius=sph.Radius())
+                             radius=sph.Radius(),
+                             u_min=u_min, u_max=u_max, u_span=u_span)
         elif st == GeomAbs_Torus:
             tor = adaptor.Torus()
             loc, ax = tor.Location(), tor.Axis().Direction()
             sd = SurfaceData(kind=SurfaceKind.TORUS,
                              point_on=np.array([loc.X(), loc.Y(), loc.Z()]),
                              axis=np.array([ax.X(), ax.Y(), ax.Z()]),
-                             radius=tor.MajorRadius(), ref_radius=tor.MinorRadius())
+                             radius=tor.MajorRadius(), ref_radius=tor.MinorRadius(),
+                             u_min=u_min, u_max=u_max, u_span=u_span)
         elif st == GeomAbs_BSplineSurface:
-            sd = SurfaceData(kind=SurfaceKind.BSPLINE)
+            sd = SurfaceData(kind=SurfaceKind.BSPLINE,
+                             u_min=u_min, u_max=u_max, u_span=u_span)
 
         # Exact oriented surface normal evaluation
         sign = -1.0 if occ_face.Orientation() == TopAbs_REVERSED else 1.0

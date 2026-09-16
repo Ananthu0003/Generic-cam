@@ -129,6 +129,28 @@ class FeatureRecognizer:
             return 0.0
         return max(float(f.triangles[:, :, 2].max()) for f in valid_faces)
 
+    def _face_u_span(self, f: Face) -> float:
+        """Return angular span of face in radians (exact from CAD or estimated from mesh)."""
+        if f.surface.u_span is not None:
+            return float(f.surface.u_span)
+        if f.surface.u_min is not None and f.surface.u_max is not None:
+            return float(abs(f.surface.u_max - f.surface.u_min))
+        if len(f.triangles) and f.surface.point_on is not None:
+            pts = f.triangles.reshape(-1, 3)
+            c = f.surface.point_on[:2]
+            angles = np.arctan2(pts[:, 1] - c[1], pts[:, 0] - c[0])
+            sorted_a = np.sort(np.unique(np.round(angles, 3)))
+            if len(sorted_a) >= 2:
+                gaps = np.diff(sorted_a)
+                wrap_gap = (2 * np.pi + sorted_a[0]) - sorted_a[-1]
+                max_gap = max(float(gaps.max()), float(wrap_gap))
+                expected_facet_gap = 2 * np.pi / max(len(sorted_a), 1)
+                if max_gap > max(expected_facet_gap * 1.6, 0.25):
+                    return float(max(0.1, 2 * np.pi - max_gap))
+                else:
+                    return float(2 * np.pi)
+        return float(2 * np.pi)
+
     def _tag_faces(self) -> dict[int, str]:
         """Classify each face by orientation relative to setup tool axis."""
         tags: dict[int, str] = {}
@@ -137,7 +159,20 @@ class FeatureRecognizer:
 
         for f in self.faces:
             if f.surface.kind == SurfaceKind.CYLINDER:
-                tags[f.index] = "cylinder"
+                u_span = self._face_u_span(f)
+                if u_span >= 2 * np.pi - 0.15:
+                    tags[f.index] = "cylinder"
+                    continue
+                # If partial cylinder (corner fillet / round), classify by axis orientation
+                if f.surface.axis is not None:
+                    axis = f.surface.axis / max(np.linalg.norm(f.surface.axis), 1e-12)
+                    dot_axis = abs(float(axis @ self.tool_axis))
+                    if dot_axis >= cos_v:
+                        tags[f.index] = "wall"
+                    else:
+                        tags[f.index] = "slanted"
+                else:
+                    tags[f.index] = "wall"
                 continue
             if f.surface.kind == SurfaceKind.CONE:
                 tags[f.index] = "cone"
@@ -195,19 +230,26 @@ class FeatureRecognizer:
         return FeatureType.THROUGH_HOLE if is_through else FeatureType.BLIND_HOLE
 
     # -------------------------------------------------------------------------
-    # Cylindrical features: Holes, Bores, Counterbores, Countersinks, Bosses
-    # -------------------------------------------------------------------------
     def _recognize_cylindrical_features(self) -> list[MachiningFeature]:
         out: list[MachiningFeature] = []
         cyl_groups = self._group_cylinder_faces()
 
-        # Step 1: Process each individual cylinder group
+        # Step 1: Process each individual cylinder group aligned with tool axis
         cyl_info: list[dict] = []
+        transverse_cyl_groups: list[list[int]] = []
+
         for g in cyl_groups:
             faces = [self.faces[i] for i in g]
             f0 = faces[0]
             sd = f0.surface
             axis = sd.axis / np.linalg.norm(sd.axis)
+            axis_alignment = abs(float(axis @ self.tool_axis))
+
+            if axis_alignment < 0.7:
+                # Transverse/horizontal feature (needs tilted tool / side setup)
+                transverse_cyl_groups.append(g)
+                continue
+
             # Ensure axis points in setup tool axis direction
             if axis @ self.tool_axis < 0:
                 axis = -axis
@@ -231,6 +273,14 @@ class FeatureRecognizer:
                 fc = f0.center[:2] - sd.point_on[:2]
                 is_internal = bool(float(f0.oriented_normal[:2] @ fc) < -1e-4)
 
+            total_u_span = sum(self._face_u_span(f) for f in faces)
+            is_full_circle = total_u_span >= 2 * np.pi - 0.15
+            is_interrupted_bore = is_internal and (total_u_span >= np.pi - 0.25)
+
+            # Partial internal cylinders (corner fillets, open arcs < 155 deg) are not holes/bores
+            if is_internal and not (is_full_circle or is_interrupted_bore):
+                continue
+
             cyl_info.append({
                 "group": g,
                 "faces": faces,
@@ -242,6 +292,8 @@ class FeatureRecognizer:
                 "depth": depth,
                 "center_xy": center_xy,
                 "is_internal": is_internal,
+                "is_interrupted": is_interrupted_bore and not is_full_circle,
+                "total_u_span": total_u_span,
             })
 
         # Step 2: Classify bosses directly
@@ -281,7 +333,7 @@ class FeatureRecognizer:
                 if j in used_internal:
                     continue
                 # Same axis location and direction
-                if np.linalg.norm(c1["center_xy"] - c2["center_xy"]) < 0.1 and abs(abs(c1["axis"] @ c2["axis"]) - 1.0) < 1e-4:
+                if np.linalg.norm(c1["center_xy"] - c2["center_xy"]) < 0.5 and abs(abs(c1["axis"] @ c2["axis"]) - 1.0) < 1e-3:
                     cluster.append(c2)
                     used_internal.add(j)
             # Sort cluster from top Z downward
@@ -315,74 +367,122 @@ class FeatureRecognizer:
                     accessibility=self._accessibility_of(c["group"]),
                     wall_faces=c["group"],
                     finish=self.requirements.get(c["group"][0]),
+                    notes={
+                        "is_interrupted": c.get("is_interrupted", False),
+                        "u_span_deg": float(np.degrees(c.get("total_u_span", 2 * np.pi))),
+                    },
                     recognition_evidence=[
                         "internal_cylinder",
                         f"diameter_{c['diameter']:.2f}",
+                        "interrupted_bore" if c.get("is_interrupted") else "full_cylinder",
                         "through_opening" if is_through else "blind_bottom",
                     ],
                 ))
             else:
-                # Multiple coaxial cylinders -> Relational Counterbore + Through Hole / Bore
-                parent_top = cluster[0]
-                child_bottom = cluster[1]
-
-                cbore_id = f"cbore_{parent_top['group'][0]}"
-                child_id = f"hole_{child_bottom['group'][0]}"
-
-                bmin_cb = np.array([parent_top["center_xy"][0] - parent_top["radius"], parent_top["center_xy"][1] - parent_top["radius"], parent_top["bottom_z"]])
-                bmax_cb = np.array([parent_top["center_xy"][0] + parent_top["radius"], parent_top["center_xy"][1] + parent_top["radius"], parent_top["top_z"]])
-
-                cbore_feat = MachiningFeature(
-                    id=cbore_id,
-                    type=FeatureType.COUNTERBORE,
-                    face_indices=parent_top["group"],
-                    bounds_min=bmin_cb,
-                    bounds_max=bmax_cb,
-                    depth=parent_top["depth"],
-                    top_z=parent_top["top_z"],
-                    floor_z=parent_top["bottom_z"],
-                    axis=parent_top["axis"].copy(),
-                    diameter=parent_top["diameter"],
-                    is_concave=True,
-                    accessibility=self._accessibility_of(parent_top["group"]),
-                    wall_faces=parent_top["group"],
-                    child_feature_ids=[child_id],
-                    recognition_evidence=[
-                        "coaxial_compound_feature",
-                        f"cbore_outer_dia_{parent_top['diameter']:.2f}",
-                        f"inner_dia_{child_bottom['diameter']:.2f}",
-                    ],
-                )
-
-                bmin_ch = np.array([child_bottom["center_xy"][0] - child_bottom["radius"], child_bottom["center_xy"][1] - child_bottom["radius"], child_bottom["bottom_z"]])
-                bmax_ch = np.array([child_bottom["center_xy"][0] + child_bottom["radius"], child_bottom["center_xy"][1] + child_bottom["radius"], child_bottom["top_z"]])
-
+                # Multi-tier coaxial cylinders (e.g. Counterbore -> Through Bore -> Bottom Counterbore)
+                cluster.sort(key=lambda x: -x["top_z"])
+                min_dia = min(c["diameter"] for c in cluster)
                 model_bottom_z = min(float(f.bounds_min[2]) for f in self.faces if len(f.triangles))
-                is_child_through = child_bottom["bottom_z"] <= model_bottom_z + 0.5
-                child_ftype = self._classify_hole_or_bore(child_bottom["diameter"], is_child_through)
-                child_feat = MachiningFeature(
-                    id=child_id,
-                    type=child_ftype,
-                    face_indices=child_bottom["group"],
-                    bounds_min=bmin_ch,
-                    bounds_max=bmax_ch,
-                    depth=child_bottom["depth"],
-                    top_z=child_bottom["top_z"],
-                    floor_z=child_bottom["bottom_z"],
-                    axis=child_bottom["axis"].copy(),
-                    diameter=child_bottom["diameter"],
-                    is_concave=True,
-                    accessibility=self._accessibility_of(child_bottom["group"]),
-                    wall_faces=child_bottom["group"],
-                    parent_feature_id=cbore_id,
-                    recognition_evidence=[
-                        "coaxial_child_bore",
-                        f"diameter_{child_bottom['diameter']:.2f}",
-                        "through_opening" if is_child_through else "blind_bottom",
-                    ],
-                )
 
-                out.extend([cbore_feat, child_feat])
+                cluster_feats: list[MachiningFeature] = []
+                for k, c in enumerate(cluster):
+                    bmin_k = np.array([c["center_xy"][0] - c["radius"], c["center_xy"][1] - c["radius"], c["bottom_z"]])
+                    bmax_k = np.array([c["center_xy"][0] + c["radius"], c["center_xy"][1] + c["radius"], c["top_z"]])
+                    is_main_bore = abs(c["diameter"] - min_dia) < 1e-3
+                    is_through = c["bottom_z"] <= model_bottom_z + 0.5
+
+                    if is_main_bore:
+                        ftype = self._classify_hole_or_bore(c["diameter"], is_through)
+                    else:
+                        ftype = FeatureType.COUNTERBORE
+
+                    feat = MachiningFeature(
+                        id=f"{'cbore' if ftype == FeatureType.COUNTERBORE else 'hole'}_{c['group'][0]}",
+                        type=ftype,
+                        face_indices=c["group"],
+                        bounds_min=bmin_k,
+                        bounds_max=bmax_k,
+                        depth=c["depth"],
+                        top_z=c["top_z"],
+                        floor_z=c["bottom_z"],
+                        axis=c["axis"].copy(),
+                        diameter=c["diameter"],
+                        is_concave=True,
+                        accessibility=self._accessibility_of(c["group"]),
+                        wall_faces=c["group"],
+                        notes={
+                            "is_interrupted": c.get("is_interrupted", False),
+                            "u_span_deg": float(np.degrees(c.get("total_u_span", 2 * np.pi))),
+                            "tier_index": k,
+                            "tier_count": len(cluster),
+                        },
+                        recognition_evidence=[
+                            "coaxial_compound_feature",
+                            f"diameter_{c['diameter']:.2f}",
+                            f"tier_{k+1}_of_{len(cluster)}",
+                        ],
+                    )
+                    cluster_feats.append(feat)
+
+                # Link parent/child relationships
+                for k, feat in enumerate(cluster_feats):
+                    if k == 0:
+                        feat.child_feature_ids = [cf.id for cf in cluster_feats[1:]]
+                    else:
+                        feat.parent_feature_id = cluster_feats[0].id
+                out.extend(cluster_feats)
+
+        # Step 4: Classify transverse / horizontal cross-holes (axis perpendicular to setup tool axis)
+        for g in transverse_cyl_groups:
+            faces = [self.faces[i] for i in g]
+            f0 = faces[0]
+            sd = f0.surface
+            axis = sd.axis / np.linalg.norm(sd.axis)
+
+            is_internal = f0.is_internal
+            if is_internal is None:
+                fc = f0.center - sd.point_on
+                is_internal = bool(float(f0.oriented_normal @ fc) < -1e-4)
+
+            total_u_span = sum(self._face_u_span(f) for f in faces)
+            if is_internal and total_u_span < np.pi - 0.25:
+                continue
+
+            all_pts = np.concatenate([f.triangles.reshape(-1, 3) for f in faces if len(f.triangles)])
+            if not len(all_pts):
+                continue
+            bmin = all_pts.min(axis=0)
+            bmax = all_pts.max(axis=0)
+            dia = 2.0 * float(sd.radius)
+            length = float(np.linalg.norm(bmax - bmin))
+
+            ftype = FeatureType.THROUGH_HOLE if is_internal else FeatureType.BOSS
+            sugg_rot = [0.0, 90.0, 0.0] if abs(axis[0]) > abs(axis[1]) else [90.0, 0.0, 0.0]
+            out.append(MachiningFeature(
+                id=f"side_hole_{g[0]}",
+                type=ftype,
+                face_indices=g,
+                bounds_min=bmin,
+                bounds_max=bmax,
+                depth=length,
+                top_z=float(bmax[2]),
+                floor_z=float(bmin[2]),
+                axis=axis.copy(),
+                diameter=dia,
+                is_concave=is_internal,
+                accessibility=Accessibility.NEEDS_TILTED_TOOL,
+                wall_faces=g,
+                notes={
+                    "is_side_feature": True,
+                    "hole_axis": axis.tolist(),
+                    "suggested_setup_rotation": sugg_rot,
+                },
+                recognition_evidence=[
+                    "transverse_cylindrical_feature",
+                    f"axis_{[round(float(x), 2) for x in axis]}",
+                    f"diameter_{dia:.2f}",
+                ],
+            ))
 
         return out
 
@@ -689,9 +789,12 @@ class FeatureRecognizer:
         out: list[MachiningFeature] = []
         for f in self.faces:
             if f.surface.kind in (SurfaceKind.CYLINDER, SurfaceKind.TORUS) and self._tags.get(f.index) in ("slanted", "wall"):
+                u_span = self._face_u_span(f)
+                if f.surface.kind == SurfaceKind.CYLINDER and u_span >= 2 * np.pi - 0.15:
+                    continue
                 radius = f.surface.radius
-                if radius and radius < 10.0 and f.area < 200.0:
-                    zs = f.triangles[:, :, 2]
+                if radius and radius < 15.0 and f.area < 500.0:
+                    zs = f.triangles[:, :, 2] if len(f.triangles) else np.array([0.0])
                     top_z, bottom_z = float(zs.max()), float(zs.min())
                     out.append(MachiningFeature(
                         id=f"fillet_{f.index}",

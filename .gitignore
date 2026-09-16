@@ -1,5 +1,5 @@
 # ==============================================================================
-# Generic CAM & Toolpath Generation .gitignore
+# VexCAM - Geometry-Driven CAM Toolpath & Simulation System .gitignore
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -69,12 +69,12 @@ dmypy.json
 .ruff_cache/
 
 # ------------------------------------------------------------------------------
-# Jupyter Notebook
+# Jupyter Notebooks
 # ------------------------------------------------------------------------------
 .ipynb_checkpoints
 
 # ------------------------------------------------------------------------------
-# Node / Web Frontend (if used)
+# Web Frontend & Node (if applicable)
 # ------------------------------------------------------------------------------
 node_modules/
 npm-debug.log*
@@ -83,7 +83,7 @@ yarn-error.log*
 .pnpm-debug.log*
 
 # ------------------------------------------------------------------------------
-# CAD/CAM Artifacts, Temporary Uploads & Scratch
+# CAD/CAM Artifacts, Temporary Uploads & Scratch Files
 # ------------------------------------------------------------------------------
 scratch/
 temp/
@@ -96,6 +96,9 @@ debug_output/
 *.step.tmp
 *.iges.tmp
 *.stl.tmp
+*.nc.tmp
+*.gcode.tmp
+*.tap.tmp
 *.tmp
 *.bak
 
@@ -111,10 +114,11 @@ debug_output/
 *.log.*
 
 # ------------------------------------------------------------------------------
-# IDEs, Editors & Assistant Workspaces
+# IDEs, Editors & AI Assistant Environments
 # ------------------------------------------------------------------------------
 .idea/
 .vscode/
+.cursor/
 *.swp
 *.swo
 *~

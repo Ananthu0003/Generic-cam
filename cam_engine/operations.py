@@ -345,7 +345,7 @@ class OperationPlanner:
                 continue
 
             drills = [t for t in self.context.tools if t.type is ToolType.DRILL]
-            exact = [d for d in drills if abs(d.diameter - f.diameter) < 1e-4]
+            exact = [d for d in drills if abs(d.diameter - f.diameter) <= 0.05 or abs(d.diameter - round(f.diameter, 2)) < 1e-4]
             if exact and f.type in (FeatureType.HOLE, FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE):
                 tool = exact[0]
                 params = self.analyzer.analyze(tool, f, OpPurpose.DRILLING.value, self.setup)
@@ -358,16 +358,25 @@ class OperationPlanner:
             mills = [t for t in self.context.tools
                      if t.type in ToolType_mill() and t.diameter < f.diameter]
             if not mills:
+                is_std_hole = f.type in (FeatureType.HOLE, FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE)
+                sugg_type = "drill" if is_std_hole else "flat_endmill"
+                if is_std_hole:
+                    sugg_dia = round(f.diameter, 2)
+                else:
+                    sugg_dia = round(max(f.diameter * 0.7, 0.2), 2)
+                    if sugg_dia >= f.diameter:
+                        sugg_dia = round(f.diameter * 0.5, 2)
+
                 self.warnings.append({
                     "code": "MISSING_TOOL",
                     "feature_id": f.id,
                     "feature_type": f.type.value if hasattr(f.type, "value") else str(f.type),
                     "feature_diameter": round(f.diameter, 2),
                     "depth": round(f.depth, 2) if f.depth else 5.0,
-                    "message": f"Feature {f.id} (dia {f.diameter:.2f}mm): no drill or endmill fits in active library",
+                    "message": f"Feature {f.id} (dia {f.diameter:.2f}mm): no {'drill or endmill' if is_std_hole else 'fitting endmill'} in active library",
                     "suggested_tool": {
-                        "type": "drill" if f.type in (FeatureType.HOLE, FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE, FeatureType.COUNTERBORE) else "flat_endmill",
-                        "diameter": round(f.diameter, 2) if f.type in (FeatureType.HOLE, FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE, FeatureType.COUNTERBORE) else round(f.diameter * 0.75, 2),
+                        "type": sugg_type,
+                        "diameter": sugg_dia,
                         "flute_length": round(max((f.depth or 5.0) * 1.25, 5.0), 1),
                         "overall_length": round(max((f.depth or 5.0) * 2.0, 30.0), 1),
                         "flutes": 2,
