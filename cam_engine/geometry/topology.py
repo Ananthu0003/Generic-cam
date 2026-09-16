@@ -105,7 +105,12 @@ class Shape:
         from OCP.BRepBndLib import BRepBndLib
         box = Bnd_Box()
         BRepBndLib.Add_s(self.occ_shape, box, True)
-        xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
+        xmin = box.GetXMin()
+        ymin = box.GetYMin()
+        zmin = box.GetZMin()
+        xmax = box.GetXMax()
+        ymax = box.GetYMax()
+        zmax = box.GetZMax()
         return np.array([xmin, ymin, zmin]), np.array([xmax, ymax, zmax])
 
     def scaled(self, factor: float) -> "Shape":
@@ -195,7 +200,10 @@ class Shape:
         from OCP.BRepMesh import BRepMesh_IncrementalMesh
         from OCP.TopExp import TopExp
         from OCP.TopAbs import TopAbs_FACE
-        from OCP.TopTools import TopTools_IndexedMapOfShape
+        try:
+            from OCP.TopTools import TopTools_IndexedMapOfShape
+        except ImportError:
+            from OCP.collections import IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher as TopTools_IndexedMapOfShape
         from OCP.TopoDS import TopoDS
 
         BRepMesh_IncrementalMesh(self.occ_shape, linear_deflection, False,
@@ -206,7 +214,7 @@ class Shape:
 
         faces: list[Face] = []
         for idx in range(1, fmap.Extent() + 1):
-            occ_face = TopoDS.Face_s(fmap.FindKey(idx))
+            occ_face = TopoDS.Face(fmap.FindKey(idx))
             faces.append(self._extract_face(idx - 1, occ_face))
         self._faces = faces
         return faces
@@ -354,13 +362,13 @@ class Shape:
 
         wexp = TopExp_Explorer(occ_face, TopAbs_WIRE)
         while wexp.More():
-            w = TopoDS.Wire_s(wexp.Current())
+            w = TopoDS.Wire(wexp.Current())
             is_out = (outer_shape is not None and hasattr(w, "IsNull") and not w.IsNull() and w.TShape() == outer_shape)
             wire_pts: list[np.ndarray] = []
             wire_edges: list[int] = []
             eexp = TopExp_Explorer(w, TopAbs_EDGE)
             while eexp.More():
-                e = TopoDS.Edge_s(eexp.Current())
+                e = TopoDS.Edge(eexp.Current())
                 try:
                     from OCP.BRepAdaptor import BRepAdaptor_Curve
                     crv = BRepAdaptor_Curve(e)
@@ -395,7 +403,10 @@ class Shape:
             return self._edges
         from OCP.TopExp import TopExp
         from OCP.TopAbs import TopAbs_EDGE
-        from OCP.TopTools import TopTools_IndexedMapOfShape
+        try:
+            from OCP.TopTools import TopTools_IndexedMapOfShape
+        except ImportError:
+            from OCP.collections import IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher as TopTools_IndexedMapOfShape
         from OCP.TopoDS import TopoDS
 
         emap = TopTools_IndexedMapOfShape()
@@ -403,7 +414,7 @@ class Shape:
 
         edges: list[Edge] = []
         for idx in range(1, emap.Extent() + 1):
-            occ_edge = TopoDS.Edge_s(emap.FindKey(idx))
+            occ_edge = TopoDS.Edge(emap.FindKey(idx))
             edges.append(self._extract_edge(idx - 1, occ_edge, deflection))
         self._edges = edges
         return edges
@@ -455,7 +466,13 @@ class Shape:
             return self._adjacency
         from OCP.TopExp import TopExp
         from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
-        from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape, TopTools_IndexedMapOfShape
+        try:
+            from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape, TopTools_IndexedMapOfShape
+        except ImportError:
+            from OCP.collections import (
+                IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher as TopTools_IndexedDataMapOfShapeListOfShape,
+                IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher as TopTools_IndexedMapOfShape
+            )
 
         fmap = TopTools_IndexedMapOfShape()
         TopExp.MapShapes_s(self.occ_shape, TopAbs_FACE, fmap)
