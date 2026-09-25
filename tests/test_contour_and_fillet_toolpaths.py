@@ -57,7 +57,7 @@ def test_corner_fillet_is_not_classified_as_hole():
     fillet_builder = BRepFilletAPI_MakeFillet(cut)
     exp = TopExp_Explorer(cut, TopAbs_EDGE)
     while exp.More():
-        e = TopoDS.Edge_s(exp.Current())
+        e = TopoDS.Edge(exp.Current())
         c = BRepAdaptor_Curve(e)
         p0 = c.Value(c.FirstParameter())
         p1 = c.Value(c.LastParameter())

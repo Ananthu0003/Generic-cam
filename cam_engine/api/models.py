@@ -256,6 +256,7 @@ class GenerateToolpathsResponse(BaseModel):
     total_rapid_length_mm: float
     estimated_time_seconds: float
     setup_id: Optional[str] = None
+    diagnostics: Optional[dict[str, Any]] = None
 
 
 class PostProcessRequest(BaseModel):

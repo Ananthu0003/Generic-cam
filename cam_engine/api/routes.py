@@ -1086,6 +1086,7 @@ def generate_toolpaths(request: Request, req: GenerateToolpathsRequest):
         total_rapid_len = 0.0
         prev_remaining_stock = None
         prev_setup = None
+        all_diagnostics = {}
 
         for s in setups:
             setup_ops = [op for op in sess.planned_ops if op.notes.get("setup_id") == s.id]
@@ -1140,6 +1141,8 @@ def generate_toolpaths(request: Request, req: GenerateToolpathsRequest):
 
             prev_remaining_stock = stock_voxels
             prev_setup = s
+            if strat_ctx.diagnostics:
+                all_diagnostics.update(strat_ctx.diagnostics)
 
         sess.toolpaths = all_toolpaths
 
@@ -1180,6 +1183,7 @@ def generate_toolpaths(request: Request, req: GenerateToolpathsRequest):
             total_rapid_length_mm=total_rapid_len,
             estimated_time_seconds=est_seconds,
             setup_id=sess.active_setup_id,
+            diagnostics=all_diagnostics if all_diagnostics else None
         )
     except CamError as e:
         raise HTTPException(status_code=400, detail=f"[{e.code}] {e.message}")

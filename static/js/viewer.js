@@ -235,12 +235,14 @@ class Cam3DViewer {
 
   setSetupOrientation(rotationDeg = [0, 0, 0], setupStockBounds = null, stockConfig = null) {
     this.currentSetupRotation = rotationDeg || [0, 0, 0];
-    if (this.partGroup) {
-      const rx = THREE.MathUtils.degToRad(rotationDeg[0] || 0);
-      const ry = THREE.MathUtils.degToRad(rotationDeg[1] || 0);
-      const rz = THREE.MathUtils.degToRad(rotationDeg[2] || 0);
-      this.partGroup.rotation.set(rx, ry, rz);
-    }
+    const rx = THREE.MathUtils.degToRad(this.currentSetupRotation[0] || 0);
+    const ry = THREE.MathUtils.degToRad(this.currentSetupRotation[1] || 0);
+    const rz = THREE.MathUtils.degToRad(this.currentSetupRotation[2] || 0);
+
+    if (this.partGroup) this.partGroup.rotation.set(rx, ry, rz);
+    if (this.toolpathGroup) this.toolpathGroup.rotation.set(rx, ry, rz);
+    if (this.stockGroup) this.stockGroup.rotation.set(rx, ry, rz);
+    if (this.fixturesGroup) this.fixturesGroup.rotation.set(rx, ry, rz);
     if (setupStockBounds && setupStockBounds.min && setupStockBounds.max) {
       this.updateFixtures(setupStockBounds, stockConfig);
       const scx = (setupStockBounds.min[0] + setupStockBounds.max[0]) / 2;
@@ -682,11 +684,12 @@ class Cam3DViewer {
     const dx = sx / (NX - 1);
     const dy = sy / (NY - 1);
 
-    // Transform points from Setup frame to Part local frame
-    const p0 = p0_setup.clone().applyMatrix4(invRotMatrix);
-    const p1 = p1_setup.clone().applyMatrix4(invRotMatrix);
+    // Points are already in Part local frame (global coordinates)
+    const p0 = p0_setup.clone();
+    const p1 = p1_setup.clone();
 
-    // Spindle vector in Part local frame
+    // Spindle vector in Part local frame: we still need to know which way the spindle is pointing!
+    // Since the tool is coming from +Z in setup frame, we need to transform +Z to global frame
     const spindleSetup = new THREE.Vector3(0, 0, 1);
     const pZero = new THREE.Vector3(0, 0, 0).applyMatrix4(invRotMatrix);
     const spindlePart = spindleSetup.clone().applyMatrix4(invRotMatrix).sub(pZero).normalize();
