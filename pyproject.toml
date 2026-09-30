@@ -1,0 +1,29 @@
+[project]
+name = "vexcam"
+version = "0.1.0"
+description = "VexCAM geometry-driven CAM toolpath planning and G-code generation from STEP files"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "shapely>=2.0",
+    "cadquery-ocp",
+    "fastapi",
+    "uvicorn",
+    "python-multipart",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "httpx", "pytest-timeout"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+timeout = 20
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["cam_engine*"]

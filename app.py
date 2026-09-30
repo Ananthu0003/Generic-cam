@@ -1,0 +1,69 @@
+"""FastAPI Application entry point for VexCAM."""
+
+from pathlib import Path
+from fastapi import FastAPI, Request
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+
+from cam_engine.api import router as cam_router
+from cam_engine.api.routes import cam_error_response
+from cam_engine.errors import CamError
+
+app = FastAPI(
+    title="VexCAM Studio API",
+    description="Geometry-driven CAM toolpath planning and G-code generation engine",
+    version="0.1.0",
+)
+
+# Enable CORS for local dev / client integrations
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include CAM API Router
+app.include_router(cam_router)
+
+
+@app.exception_handler(CamError)
+def cam_error_handler(request: Request, exc: CamError) -> JSONResponse:
+    """A CAM failure (e.g. G-code blocked by an operation validity check) is a
+    client-visible error, never an unhandled 500 traceback."""
+    return cam_error_response(exc)
+
+# Mount static frontend directory
+STATIC_DIR = Path(__file__).parent / "static"
+STATIC_DIR.mkdir(exist_ok=True)
+
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def serve_favicon():
+    favicon_svg = STATIC_DIR / "favicon.svg"
+    if favicon_svg.exists():
+        return FileResponse(favicon_svg, media_type="image/svg+xml")
+    favicon_ico = STATIC_DIR / "favicon.ico"
+    if favicon_ico.exists():
+        return FileResponse(favicon_ico)
+    from fastapi import Response
+    return Response(status_code=204)
+
+
+@app.get("/")
+async def serve_index():
+    index_file = STATIC_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file)
+    return {"status": "VexCAM API is running", "docs": "/docs"}
+
+
+if __name__ == "__main__":
+    import os
+    import uvicorn
+    port = int(os.environ.get("PORT", 8001))
+    uvicorn.run("app:app", host="127.0.0.1", port=port, reload=True)

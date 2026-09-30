@@ -1,0 +1,763 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VexCAM Studio | Geometry-Driven Toolpath Planning & 3D Simulation</title>
+  <meta name="description" content="State-of-the-art geometry-driven CAM toolpath generation, feature recognition, 3D simulation, and G-code export from STEP CAD models.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/css/style.css?v=3.1">
+  <!-- Three.js and OrbitControls via CDN -->
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+  <div id="app-container">
+    <!-- Top Header -->
+    <header id="top-header">
+      <div class="header-left">
+        <div class="logo-badge">
+          <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+          </svg>
+          <span class="logo-title">VEX<span>CAM</span></span>
+          <span class="version-tag">v0.2.0</span>
+        </div>
+        <div class="active-model-indicator">
+          <span class="status-dot"></span>
+          <span id="header-model-name" class="model-name">Prismatic CAM Test Bracket</span>
+        </div>
+      </div>
+
+      <div class="header-center">
+        <div class="workflow-stepper">
+          <button class="step-btn active" data-step="1" id="step-btn-1">
+            <span class="step-num">1</span> CAD Model
+          </button>
+          <button class="step-btn" data-step="2" id="step-btn-2">
+            <span class="step-num">2</span> Setups & Stock
+          </button>
+          <button class="step-btn" data-step="3" id="step-btn-3">
+            <span class="step-num">3</span> Features
+          </button>
+          <button class="step-btn" data-step="4" id="step-btn-4">
+            <span class="step-num">4</span> Tooling & Ops
+          </button>
+          <button class="step-btn" data-step="5" id="step-btn-5">
+            <span class="step-num">5</span> Toolpaths
+          </button>
+          <button class="step-btn" data-step="6" id="step-btn-6">
+            <span class="step-num">6</span> G-Code
+          </button>
+        </div>
+      </div>
+
+      <div class="header-right">
+        <button id="btn-load-demo" class="btn btn-secondary" title="Reload test model">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>
+          Demo Model
+        </button>
+        <button id="btn-export-gcode" class="btn btn-primary" title="Export G-Code">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Export G-Code
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Workspace -->
+    <main id="main-workspace">
+      <!-- Left Sidebar Panel -->
+      <aside id="sidebar-panel">
+        <!-- Step 1: CAD Model Import -->
+        <section id="panel-step-1" class="step-panel active">
+          <div class="panel-header">
+            <h3>1. CAD Model &amp; Import</h3>
+            <p class="panel-subtitle">Upload a 3D STEP / STP file and align the part to the spindle Z-axis.</p>
+          </div>
+
+          <div class="upload-dropzone" id="dropzone">
+            <input type="file" id="file-input" accept=".step,.stp,.stl" style="display: none;">
+            <svg viewBox="0 0 24 24" width="36" height="36" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+            <p class="dropzone-text"><strong>Click to browse</strong> or drag &amp; drop CAD files (.step / .stp / .stl)</p>
+            <span class="dropzone-hint">Parsed directly into exact OpenCASCADE B-Rep topology</span>
+          </div>
+
+          <div class="card stat-card mb-3">
+            <h4>Part Dimensions &amp; Bounds</h4>
+            <div class="stat-grid">
+              <div class="stat-item">
+                <span class="stat-label">Size X (Length)</span>
+                <span class="stat-value mono" id="stat-dim-x">100.00 mm</span>
+              </div>
+              <div class="stat-item">
+                <span class="stat-label">Size Y (Width)</span>
+                <span class="stat-value mono" id="stat-dim-y">60.00 mm</span>
+              </div>
+              <div class="stat-item">
+                <span class="stat-label">Size Z (Height)</span>
+                <span class="stat-value mono" id="stat-dim-z">25.00 mm</span>
+              </div>
+              <div class="stat-item">
+                <span class="stat-label">Triangles / Faces</span>
+                <span class="stat-value mono" id="stat-mesh-count">48 / 11</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Part Orientation Toolbar -->
+          <div class="card mb-3">
+            <h4>WCS Part Alignment &amp; Orientation</h4>
+            <p class="card-subtitle">Rotate CAD model to align the top machining face with the Spindle (+Z).</p>
+            <div class="button-row">
+              <button id="btn-orient-rx-90" class="btn btn-sm btn-secondary" title="Rotate +90° around X axis">↺ Rot X +90°</button>
+              <button id="btn-orient-ry-90" class="btn btn-sm btn-secondary" title="Rotate +90° around Y axis">↺ Rot Y +90°</button>
+              <button id="btn-orient-rz-90" class="btn btn-sm btn-secondary" title="Rotate +90° around Z axis">↺ Rot Z +90°</button>
+            </div>
+            <div class="button-row mt-2">
+              <button id="btn-orient-flip-x" class="btn btn-sm btn-secondary" title="Flip 180° around X axis">⇅ Flip X 180°</button>
+              <button id="btn-orient-flip-y" class="btn btn-sm btn-secondary" title="Flip 180° around Y axis">⇄ Flip Y 180°</button>
+            </div>
+          </div>
+
+          <div class="panel-actions">
+            <button class="btn btn-action next-step-btn" data-next="2">
+              Next: Configure Setups &amp; Stock &rarr;
+            </button>
+          </div>
+        </section>
+
+        <!-- Step 2: Setups & Stock -->
+        <section id="panel-step-2" class="step-panel">
+          <div class="panel-header">
+            <h3>2. Machining Setups &amp; Stock</h3>
+            <p class="panel-subtitle">Define multi-setup operations (OP10 Top, OP20 Bottom Flip) and raw stock.</p>
+          </div>
+
+          <!-- Multi-Setup Manager Widget -->
+          <div class="card mb-3">
+            <div class="card-header-flex">
+              <h4>Machining Setups (Multi-Setup)</h4>
+              <div style="display: flex; gap: 6px;">
+                <button id="btn-auto-detect-setups" class="btn btn-xs btn-secondary" title="Auto-Detect Setups from 3D Model Geometry">&#9889; Auto-Detect</button>
+                <button id="btn-open-add-setup" class="btn btn-xs btn-primary">+ Add Setup</button>
+              </div>
+            </div>
+            <p class="card-subtitle">Each setup defines a separate fixturing orientation and work offset (G54, G55).</p>
+            <div class="setup-tabs-list" id="setup-tabs-container">
+              <!-- Dynamically populated -->
+            </div>
+          </div>
+
+          <!-- Add Setup Form (hidden by default) -->
+          <div id="add-setup-form" class="card mb-3" style="display: none;">
+            <h4>Add New Setup</h4>
+            <div class="form-group mb-2">
+              <label>Setup Name</label>
+              <input type="text" id="new-setup-name" class="form-input" value="Setup 2 - Bottom Flip">
+            </div>
+            <div class="form-group mb-2">
+              <label>Preset Orientation</label>
+              <select id="new-setup-preset" class="form-select">
+                <option value="flip_x_180">Flip 180° (X-Axis) - Bottom Machining</option>
+                <option value="flip_y_180">Flip 180° (Y-Axis) - Bottom Machining</option>
+                <option value="side_x_90">Side 90° (X-Axis) - Side Wall Machining</option>
+                <option value="side_y_90">Side 90° (Y-Axis) - End Face Machining</option>
+              </select>
+            </div>
+            <div class="form-group mb-2">
+              <label>Work Coordinate Offset</label>
+              <select id="new-setup-workoffset" class="form-select">
+                <option value="G55" selected>G55 (Fixture 2)</option>
+                <option value="G56">G56 (Fixture 3)</option>
+                <option value="G57">G57 (Fixture 4)</option>
+                <option value="G54">G54 (Same Fixture)</option>
+              </select>
+            </div>
+            <div class="button-row mt-2">
+              <button id="btn-confirm-add-setup" class="btn btn-sm btn-primary">Save Setup</button>
+              <button id="btn-cancel-add-setup" class="btn btn-sm btn-secondary">Cancel</button>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Workpiece Material</label>
+            <select id="stock-material" class="form-select">
+              <option value="aluminum_6061">Aluminum 6061-T6 (General Machining)</option>
+              <option value="aluminum_7075">Aluminum 7075-T6 (High Strength Aerospace)</option>
+              <option value="becu" selected>Beryllium Copper BeCu (C17200 / C17300)</option>
+              <option value="copper_110">Copper 110 Pure Electrolytic (C11000)</option>
+              <option value="brass_360">Brass 360 (Free Cutting)</option>
+              <option value="bronze_660">Bronze 660 (SAE 660 / C93200)</option>
+              <option value="steel_1018">Steel 1018 (Low Carbon)</option>
+              <option value="steel_4140">Steel 4140 (Pre-Hard Alloy)</option>
+              <option value="tool_steel_d2">Tool Steel D2 (High Carbon)</option>
+              <option value="tool_steel_o1">Tool Steel O1 (Oil-Hardening)</option>
+              <option value="stainless_304">Stainless 304 (Austenitic)</option>
+              <option value="stainless_316">Stainless 316 (Marine Grade)</option>
+              <option value="stainless_17_4ph">Stainless 17-4 PH (Condition H1025)</option>
+              <option value="titanium_gr5">Titanium Ti-6Al-4V (Grade 5)</option>
+              <option value="inconel_718">Inconel 718 (Nickel Superalloy)</option>
+              <option value="cast_iron_gray">Cast Iron Class 30 (Gray Iron)</option>
+              <option value="delrin_acetal">Delrin / Acetal POM-C Plastic</option>
+              <option value="peek">PEEK High Performance Polymer</option>
+            </select>
+          </div>
+
+          <div class="card mb-3">
+            <h4>Raw Stock Definition</h4>
+            <div class="form-group mb-3">
+              <label>Stock Mode</label>
+              <select id="stock-mode" class="form-select">
+                <option value="relative_box" selected>Relative Size Box (Auto Bounding Box + Margins)</option>
+                <option value="fixed_box">Fixed Size Box (Exact Billet Dimensions)</option>
+                <option value="relative_cylinder">Relative Size Cylinder (Auto Diameter + Margins)</option>
+                <option value="fixed_cylinder">Fixed Size Cylinder (Standard Purchased Round Bar)</option>
+              </select>
+            </div>
+
+            <!-- Panel 1: Relative Box -->
+            <div id="stock-panel-relative-box" class="stock-mode-subpanel">
+              <p class="card-subtitle mb-2">Rectangular bounding envelope with custom padding allowances.</p>
+              <div class="input-grid">
+                <div class="input-field">
+                  <label>Side Margins X/Y</label>
+                  <div class="input-unit">
+                    <input type="number" id="stock-margin-xy" value="5.0" step="0.5" min="0">
+                    <span>mm</span>
+                  </div>
+                </div>
+                <div class="input-field">
+                  <label>Top Face Stock</label>
+                  <div class="input-unit">
+                    <input type="number" id="stock-margin-z-top" value="1.0" step="0.5" min="0">
+                    <span>mm</span>
+                  </div>
+                </div>
+                <div class="input-field">
+                  <label>Bottom Hold Margin</label>
+                  <div class="input-unit">
+                    <input type="number" id="stock-margin-z-bot" value="3.0" step="0.5" min="0">
+                    <span>mm</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Panel 2: Fixed Size Box -->
+            <div id="stock-panel-fixed-box" class="stock-mode-subpanel" style="display: none;">
+              <p class="card-subtitle mb-2">Standard rectangular bar or pre-cut billet from inventory.</p>
+              <div class="input-grid">
+                <div class="input-field">
+                  <label>Stock Length (X)</label>
+                  <div class="input-unit">
+                    <input type="number" id="stock-fixed-x" value="100.0" step="1.0" min="1.0">
+                    <span>mm</span>
+                  </div>
+                </div>
+                <div class="input-field">
+                  <label>Stock Width (Y)</label>
+                  <div class="input-unit">
+                    <input type="number" id="stock-fixed-y" value="60.0" step="1.0" min="1.0">
+                    <span>mm</span>
+                  </div>
+                </div>
+                <div class="input-field">
+                  <label>Stock Height (Z)</label>
+                  <div class="input-unit">
+                    <input type="number" id="stock-fixed-z" value="30.0" step="1.0" min="1.0">
+                    <span>mm</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Panel 3: Relative Size Cylinder -->
+            <div id="stock-panel-relative-cylinder" class="stock-mode-subpanel" style="display: none;">
+              <p class="card-subtitle mb-2">Round stock auto-sized around part diameter with radial & axial allowances.</p>
+              <div class="input-grid">
+                <div class="input-field">
+                  <label>Radial Margin</label>
+                  <div class="input-unit">
+                    <input type="number" id="stock-rel-cyl-radial" value="2.5" step="0.5" min="0">
+                    <span>mm</span>
+                  </div>
+                </div>
+                <div class="input-field">
+                  <label>Top Face Stock</label>
+                  <div class="input-unit">
+                    <input type="number" id="stock-rel-cyl-top" value="1.0" step="0.5" min="0">
+                    <span>mm</span>
+                  </div>
+                </div>
+                <div class="input-field">
+                  <label>Bottom / Chuck Hold</label>
+                  <div class="input-unit">
+                    <input type="number" id="stock-rel-cyl-bot" value="15.0" step="1.0" min="0">
+                    <span>mm</span>
+                  </div>
+                </div>
+              </div>
+              <div class="form-group mt-2">
+                <label>Cylinder Spindle Axis</label>
+                <select id="stock-rel-cyl-axis" class="form-select">
+                  <option value="Z" selected>+Z (Spindle / Vertical / Rotary Table)</option>
+                  <option value="X">+X (Horizontal / Lathe Main Spindle)</option>
+                  <option value="Y">+Y (Transverse Rotary)</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- Panel 4: Fixed Size Cylinder -->
+            <div id="stock-panel-fixed-cylinder" class="stock-mode-subpanel" style="display: none;">
+              <p class="card-subtitle mb-2">Purchased round bar from inventory (e.g. Ø80mm x 50mm).</p>
+              <div class="input-grid">
+                <div class="input-field">
+                  <label>Bar Diameter Ø</label>
+                  <div class="input-unit">
+                    <input type="number" id="stock-fixed-cyl-dia" value="80.0" step="1.0" min="1.0">
+                    <span>mm</span>
+                  </div>
+                </div>
+                <div class="input-field">
+                  <label>Bar Cut Length</label>
+                  <div class="input-unit">
+                    <input type="number" id="stock-fixed-cyl-len" value="50.0" step="1.0" min="1.0">
+                    <span>mm</span>
+                  </div>
+                </div>
+                <div class="input-field">
+                  <label>Top Facing Allowance</label>
+                  <div class="input-unit">
+                    <input type="number" id="stock-fixed-cyl-top" value="1.0" step="0.5" min="0">
+                    <span>mm</span>
+                  </div>
+                </div>
+              </div>
+              <div class="form-group mt-2">
+                <label>Cylinder Spindle Axis</label>
+                <select id="stock-fixed-cyl-axis" class="form-select">
+                  <option value="Z" selected>+Z (Spindle / Vertical / Rotary Table)</option>
+                  <option value="X">+X (Horizontal / Lathe Main Spindle)</option>
+                  <option value="Y">+Y (Transverse Rotary)</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- Shared Stock Center Offsets -->
+            <div class="input-grid mt-3 pt-2" style="border-top: 1px solid var(--border-color, #2a2e39);">
+              <div class="input-field">
+                <label>Stock Center Offset X</label>
+                <div class="input-unit">
+                  <input type="number" id="stock-offset-x" value="0.0" step="0.5">
+                  <span>mm</span>
+                </div>
+              </div>
+              <div class="input-field">
+                <label>Stock Center Offset Y</label>
+                <div class="input-unit">
+                  <input type="number" id="stock-offset-y" value="0.0" step="0.5">
+                  <span>mm</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card mb-3">
+            <h4>Clamping &amp; Workholding Fixture</h4>
+            <div class="form-group mb-2">
+              <label>Fixture Type</label>
+              <select id="stock-clamp-type" class="form-select">
+                <option value="vise_jaws" selected>Precision Vise Jaws (Kurt / 6-inch)</option>
+                <option value="toe_clamps">Corner Step / Toe Clamps (4x)</option>
+                <option value="none">No Fixture (Vacuum / Direct Fixture Plate)</option>
+              </select>
+            </div>
+            <div class="input-grid">
+              <div class="input-field">
+                <label>Clamp Grip Height</label>
+                <div class="input-unit">
+                  <input type="number" id="stock-clamp-height" value="3.0" step="0.5" min="0.5">
+                  <span>mm</span>
+                </div>
+              </div>
+              <div class="input-field">
+                <label>Vise Jaw Width</label>
+                <div class="input-unit">
+                  <input type="number" id="stock-clamp-width" value="14.0" step="1.0" min="5.0">
+                  <span>mm</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h4>Advanced Machining Parameters</h4>
+            <div class="input-grid">
+              <div class="input-field">
+                <label>Thread Pitch (mm)</label>
+                <div class="input-unit">
+                  <input type="number" id="thread-pitch" value="1.0" step="0.1" min="0.1">
+                  <span>mm</span>
+                </div>
+              </div>
+              <div class="input-field">
+                <label>Groove Width (mm)</label>
+                <div class="input-unit">
+                  <input type="number" id="groove-width" value="3.0" step="0.5" min="1.0">
+                  <span>mm</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel-actions">
+            <button class="btn btn-action next-step-btn" data-next="3">
+              Next: Recognize Features &rarr;
+            </button>
+          </div>
+        </section>
+
+        <!-- Step 3: Features Recognition -->
+        <section id="panel-step-3" class="step-panel">
+          <div class="panel-header">
+            <h3>3. B-Rep Feature Recognition</h3>
+            <p class="panel-subtitle">Topology-driven identification of machinable features per setup.</p>
+          </div>
+
+          <button id="btn-run-feature-rec" class="btn btn-secondary w-100 mb-3">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="m4.93 4.93 4.24 4.24"/><path d="m14.83 9.17 4.24-4.24"/><path d="m14.83 14.83 4.24 4.24"/><path d="m9.17 14.83-4.24 4.24"/></svg>
+            Scan Features for All Setups
+          </button>
+
+          <div class="feature-list" id="feature-list-container">
+            <!-- Dynamically populated -->
+          </div>
+
+          <div class="panel-actions">
+            <button class="btn btn-action next-step-btn" data-next="4">
+              Next: Configure Tooling &amp; Ops &rarr;
+            </button>
+          </div>
+        </section>
+
+        <!-- Step 4: Tooling & Operations Planning -->
+        <section id="panel-step-4" class="step-panel">
+          <div class="panel-header">
+            <h3>4. Tooling Catalog &amp; Machining Sequence</h3>
+            <p class="panel-subtitle">Capability-driven operation planning with feeds &amp; speeds.</p>
+          </div>
+
+          <div class="card mb-3">
+            <div class="d-flex justify-content-between align-items-center mb-2" style="display:flex; justify-content:space-between; align-items:center;">
+              <h4 style="margin:0;">Active Tool Library</h4>
+              <button id="btn-show-add-tool" class="btn btn-sm btn-outline" style="font-size:0.8rem; padding:4px 10px;">+ Add Tool</button>
+            </div>
+
+            <!-- Add Custom Tool Form (hidden by default) -->
+            <div id="add-tool-form-card" class="mb-3 p-3" style="display:none; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.1); border-radius:8px;">
+              <h5 style="margin-top:0; font-size:0.9rem; color:#38bdf8;">Add Custom Tool</h5>
+              <div class="input-grid" style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+                <div class="input-field">
+                  <label style="font-size:0.75rem;">Tool Type</label>
+                  <select id="new-tool-type" class="form-select" style="font-size:0.8rem; padding:4px 8px;">
+                    <option value="drill" selected>Drill</option>
+                    <option value="flat_endmill">Flat Endmill</option>
+                    <option value="ball_endmill">Ball Endmill</option>
+                    <option value="bullnose_endmill">Bullnose Endmill</option>
+                    <option value="chamfer_mill">Chamfer Mill</option>
+                    <option value="countersink_tool">Countersink Tool</option>
+                    <option value="boring_bar">Boring Bar</option>
+                    <option value="reamer">Reamer</option>
+                    <option value="tap">Tap</option>
+                    <option value="face_mill">Face Mill</option>
+                  </select>
+                </div>
+                <div class="input-field">
+                  <label style="font-size:0.75rem;">Diameter (mm)</label>
+                  <div class="input-unit">
+                    <input type="number" id="new-tool-dia" value="0.58" step="0.01" min="0.1" style="font-size:0.8rem;">
+                    <span>mm</span>
+                  </div>
+                </div>
+                <div class="input-field">
+                  <label style="font-size:0.75rem;">Flute Length (mm)</label>
+                  <div class="input-unit">
+                    <input type="number" id="new-tool-flute" value="10.0" step="0.5" min="1.0" style="font-size:0.8rem;">
+                    <span>mm</span>
+                  </div>
+                </div>
+                <div class="input-field">
+                  <label style="font-size:0.75rem;">Flutes</label>
+                  <input type="number" id="new-tool-flutes" value="2" step="1" min="1" max="12" style="font-size:0.8rem;">
+                </div>
+              </div>
+              <div class="button-row mt-2" style="display:flex; gap:8px; margin-top:10px;">
+                <button id="btn-save-new-tool" class="btn btn-sm btn-primary" style="font-size:0.8rem; padding:4px 12px;">Save Tool</button>
+                <button id="btn-cancel-new-tool" class="btn btn-sm btn-secondary" style="font-size:0.8rem; padding:4px 12px;">Cancel</button>
+              </div>
+            </div>
+
+            <div class="tool-list" id="tool-list-container">
+              <!-- Dynamically populated -->
+            </div>
+          </div>
+
+          <!-- Operation Planning Warnings & Auto-Add Actions -->
+          <div id="op-planning-warnings" class="mb-3" style="display:none;"></div>
+
+
+          <div class="card">
+            <h4>Planned Machining Operations</h4>
+            <div class="op-list" id="op-list-container">
+              <!-- Dynamically populated -->
+            </div>
+          </div>
+
+          <div class="panel-actions">
+            <button class="btn btn-action next-step-btn" data-next="5">
+              Next: Generate Toolpaths &rarr;
+            </button>
+          </div>
+        </section>
+
+        <!-- Step 5: Toolpaths & Simulation -->
+        <section id="panel-step-5" class="step-panel">
+          <div class="panel-header">
+            <h3>5. Toolpaths &amp; 3D Simulation</h3>
+            <p class="panel-subtitle">Generate continuous cutting motion across all setups and simulate spindle movement.</p>
+          </div>
+
+          <button id="btn-generate-toolpaths" class="btn btn-action w-100 mb-3">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            Generate Toolpaths (All Setups)
+          </button>
+
+          <!-- Setup Filter Tabs for Toolpaths & Simulation -->
+          <div id="toolpaths-setup-tabs-container" class="gcode-setup-tabs mb-3" style="display: none;"></div>
+
+          <div class="card stat-card mb-3">
+            <h4>Toolpath Analytics</h4>
+            <div class="stat-grid">
+              <div class="stat-item">
+                <span class="stat-label">Cutting Length</span>
+                <span class="stat-value mono text-cyan" id="stat-cut-len">0.0 mm</span>
+              </div>
+              <div class="stat-item">
+                <span class="stat-label">Rapid Length</span>
+                <span class="stat-value mono text-amber" id="stat-rapid-len">0.0 mm</span>
+              </div>
+              <div class="stat-item">
+                <span class="stat-label">Estimated Time</span>
+                <span class="stat-value mono text-emerald" id="stat-est-time">0m 00s</span>
+              </div>
+              <div class="stat-item">
+                <span class="stat-label">Total Segments</span>
+                <span class="stat-value mono" id="stat-seg-count">0</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Simulation Controls -->
+          <div class="card sim-controls-card">
+            <h4>3D Tool Simulation</h4>
+            <div class="sim-buttons">
+              <button id="sim-btn-play" class="btn btn-secondary" title="Play / Pause">
+                <svg id="sim-play-icon" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              </button>
+              <button id="sim-btn-reset" class="btn btn-secondary" title="Restart">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>
+              </button>
+              <div class="speed-select-wrapper">
+                <label>Speed:</label>
+                <select id="sim-speed-select" class="form-select-sm">
+                  <option value="1">1x</option>
+                  <option value="2" selected>2x</option>
+                  <option value="5">5x</option>
+                  <option value="10">10x</option>
+                </select>
+              </div>
+            </div>
+            <div class="sim-scrubber-wrapper">
+              <input type="range" id="sim-scrubber" min="0" max="100" value="0" step="0.1">
+              <div class="sim-progress-readout mono">
+                <span id="sim-curr-time">00:00</span> / <span id="sim-total-time">00:00</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel-actions">
+            <button class="btn btn-action next-step-btn" data-next="6">
+              Next: Post-Process G-Code &rarr;
+            </button>
+          </div>
+        </section>
+
+        <!-- Step 6: G-Code Post Processing -->
+        <section id="panel-step-6" class="step-panel">
+          <div class="panel-header">
+            <h3>6. CNC G-Code Post-Processor</h3>
+            <p class="panel-subtitle">Post-process toolpaths into controller-specific NC programs with multi-setup datum management.</p>
+          </div>
+
+          <div class="form-group mb-2">
+            <label>Target CNC Controller</label>
+            <select id="post-controller-select" class="form-select">
+              <option value="grbl" selected>GRBL / OpenBuilds / Shapeoko</option>
+              <option value="fanuc">Fanuc 3-Axis Mill (Standard ISO)</option>
+              <option value="haas">Haas CNC Machining Center</option>
+              <option value="linuxcnc">LinuxCNC / AXIS (RS274/NGC)</option>
+              <option value="heidenhain">Heidenhain TNC (Conversational Klartext)</option>
+              <option value="siemens">Siemens Sinumerik 840D / 828D</option>
+            </select>
+          </div>
+
+          <!-- Setup Filter Tabs -->
+          <div id="gcode-setup-tabs-container" class="gcode-setup-tabs" style="display: none;"></div>
+
+          <div class="gcode-viewer-container" id="gcode-viewer-single">
+            <div class="gcode-header">
+              <div class="gcode-meta-info">
+                <span class="gcode-meta-primary" id="gcode-line-counter">0 lines</span>
+                <span class="gcode-meta-secondary" id="gcode-setup-badge">All Setups</span>
+              </div>
+              <button id="btn-copy-gcode" class="btn btn-xs btn-secondary" title="Copy G-code to clipboard">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                Copy
+              </button>
+            </div>
+            <pre id="gcode-output" class="mono gcode-block"><code>(Click "Generate Toolpaths" to produce G-Code)</code></pre>
+          </div>
+
+          <div class="panel-actions mt-3">
+            <div class="action-grid-2 mb-2">
+              <button id="btn-download-file" class="btn btn-primary" style="font-size: 0.8rem; padding: 9px 10px;" title="Download active setup NC file">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                <span id="btn-download-label">Download .NC</span>
+              </button>
+              <button id="btn-export-package" class="btn btn-secondary" style="font-size: 0.8rem; padding: 9px 10px;" title="Export complete multi-setup package with NCs and Setup Sheets">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+                Export .ZIP
+              </button>
+            </div>
+            <button id="btn-view-setup-sheet" class="btn btn-secondary w-100" style="font-size: 0.82rem;" title="View shop floor setup sheets and master routing">
+              <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+              View Shop Floor Setup Sheet
+            </button>
+          </div>
+        </section>
+      </aside>
+
+      <!-- Center 3D Viewport -->
+      <div id="viewport-container">
+        <div id="canvas-3d"></div>
+
+
+        <!-- Viewport Toolbar Floating Controls -->
+        <div class="viewport-toolbar">
+          <button class="view-tool-btn active" id="toggle-part" title="Toggle Part Model">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+            Part
+          </button>
+          <button class="view-tool-btn active" id="toggle-stock" title="Toggle Raw Stock">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/></svg>
+            Stock
+          </button>
+          <button class="view-tool-btn active" id="toggle-fixture" title="Toggle Clamping Fixture">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg>
+            Fixture
+          </button>
+          <button class="view-tool-btn active" id="toggle-toolpath" title="Toggle Toolpath Lines">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
+            Toolpath
+          </button>
+          <button class="view-tool-btn active" id="toggle-tool" title="Toggle Tool & Spindle">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 2h6v5H9zM7 7h10v3l-5 12-5-12zM8 11h8M9 15h6"/></svg>
+            Tool
+          </button>
+          <button class="view-tool-btn" id="toggle-wireframe" title="Toggle Wireframe">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+            Wireframe
+          </button>
+          <div class="toolbar-divider"></div>
+          <button class="view-tool-btn" id="view-iso" title="Isometric View">ISO</button>
+          <button class="view-tool-btn" id="view-top" title="Top View (XY)">Top</button>
+          <button class="view-tool-btn" id="view-front" title="Front View (XZ)">Front</button>
+          <button class="view-tool-btn" id="view-reset" title="Fit Camera">Fit</button>
+        </div>
+
+        <!-- 3D Legend & HUD Readout -->
+        <div class="viewport-hud">
+          <div class="hud-item">
+            <span class="hud-label">Spindle</span>
+            <span class="hud-value mono text-cyan" id="hud-spindle">0 RPM</span>
+          </div>
+          <div class="hud-item">
+            <span class="hud-label">Feed</span>
+            <span class="hud-value mono text-emerald" id="hud-feed">0 mm/min</span>
+          </div>
+          <div class="hud-item">
+            <span class="hud-label">Tool</span>
+            <span class="hud-value mono" id="hud-tool">--</span>
+          </div>
+          <div class="hud-item">
+            <span class="hud-label">Position (X, Y, Z)</span>
+            <span class="hud-value mono text-amber" id="hud-xyz">X 0.00 Y 0.00 Z 35.00</span>
+          </div>
+        </div>
+
+        <!-- Toolpath Motion Legend -->
+        <div class="toolpath-legend">
+          <div class="legend-item"><span class="legend-swatch cut"></span> Cutting Feed (G1)</div>
+          <div class="legend-item"><span class="legend-swatch rapid"></span> Rapid Motion (G0)</div>
+          <div class="legend-item"><span class="legend-swatch plunge"></span> Plunge / Ramp</div>
+          <div class="legend-item"><span class="legend-swatch arc"></span> Circular Arc (G2/G3)</div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Setup Sheet Modal -->
+  <div id="setup-sheet-modal" class="modal-backdrop">
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <div class="modal-title">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" class="text-cyan"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+          Shop Floor Documentation &amp; Setup Routing Sheet
+        </div>
+        <button id="btn-close-setup-sheet" class="modal-close-btn" title="Close">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="d-flex justify-between align-center mb-3">
+          <div id="setup-sheet-tabs" class="gcode-setup-tabs">
+            <button class="gcode-setup-tab active" data-type="master">Master Routing (All Setups)</button>
+          </div>
+          <span class="text-dim mono" style="font-size: 0.75rem;" id="setup-sheet-meta"></span>
+        </div>
+        <pre id="setup-sheet-content" class="mono gcode-block" style="max-height: 480px;"></pre>
+      </div>
+      <div class="modal-footer">
+        <button id="btn-copy-setup-sheet" class="btn btn-secondary">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          Copy Report
+        </button>
+        <button id="btn-print-setup-sheet" class="btn btn-primary">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
+          Print / Save PDF
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/js/viewer.js?v=5.5"></script>
+  <script src="/static/js/app.js?v=5.5"></script>
+</body>
+</html>
+
