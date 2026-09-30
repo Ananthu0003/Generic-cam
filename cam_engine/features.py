@@ -80,6 +80,7 @@ class MachiningFeature:
     recognition_evidence: list[str] = field(default_factory=list)
     source_edges: list[int] = field(default_factory=list)
     finish: Optional[FinishRequirement] = None
+    setup_id: Optional[str] = None          # assigned during single global recognition pass
     notes: dict = field(default_factory=dict)
     boundary_loop: Optional[list[np.ndarray]] = None
     island_loops: list[list[np.ndarray]] = field(default_factory=list)

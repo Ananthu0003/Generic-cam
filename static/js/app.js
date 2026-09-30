@@ -108,6 +108,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // Step 4: Tools & Ops
   const toolListContainer = document.getElementById('tool-list-container');
   const opListContainer = document.getElementById('op-list-container');
+  const btnReplanOperations = document.getElementById('btn-replan-operations');
 
   // Step 5: Toolpaths & Simulation
   const btnGenerateToolpaths = document.getElementById('btn-generate-toolpaths');
@@ -419,8 +420,30 @@ document.addEventListener('DOMContentLoaded', () => {
 
   if (btnAutoDetectSetups) {
     btnAutoDetectSetups.addEventListener('click', async () => {
+      const originalHtml = btnAutoDetectSetups.innerHTML;
+      const rect = btnAutoDetectSetups.getBoundingClientRect();
+      const originalWidth = rect.width;
+
+      btnAutoDetectSetups.disabled = true;
+      btnAutoDetectSetups.classList.add('btn-loading');
+      if (originalWidth > 0) {
+        btnAutoDetectSetups.style.minWidth = `${originalWidth}px`;
+      }
+      btnAutoDetectSetups.innerHTML = `
+        <span class="btn-spinner"></span>
+        <span>Detecting...</span>
+      `;
+
       try {
         const res = await fetch('/api/setups/auto-generate', { method: 'POST' });
+        if (!res.ok) {
+          let errMsg = 'Failed to auto-generate setups';
+          try {
+            const errData = await res.json();
+            errMsg = errData.detail || errMsg;
+          } catch (_) {}
+          throw new Error(errMsg);
+        }
         const data = await res.json();
         state.setups = data.setups;
         state.activeSetupId = data.active_setup_id;
@@ -434,8 +457,37 @@ document.addEventListener('DOMContentLoaded', () => {
         state.features = [];
         state.plannedOps = [];
         state.toolpaths = [];
+
+        // Temporary success gesture
+        btnAutoDetectSetups.classList.remove('btn-loading');
+        btnAutoDetectSetups.classList.add('btn-success-state');
+        const setupCount = data.setups ? data.setups.length : 0;
+        btnAutoDetectSetups.innerHTML = `
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+          <span>${setupCount} Setup${setupCount === 1 ? '' : 's'} Found</span>
+        `;
+
+        setTimeout(() => {
+          btnAutoDetectSetups.classList.remove('btn-success-state');
+          btnAutoDetectSetups.innerHTML = originalHtml;
+          btnAutoDetectSetups.style.minWidth = '';
+          btnAutoDetectSetups.disabled = false;
+        }, 1200);
+
       } catch (err) {
         console.error('Failed to auto-generate setups:', err);
+        btnAutoDetectSetups.classList.remove('btn-loading');
+        btnAutoDetectSetups.classList.add('btn-error-state');
+        btnAutoDetectSetups.innerHTML = `
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          <span>Failed</span>
+        `;
+        setTimeout(() => {
+          btnAutoDetectSetups.classList.remove('btn-error-state');
+          btnAutoDetectSetups.innerHTML = originalHtml;
+          btnAutoDetectSetups.style.minWidth = '';
+          btnAutoDetectSetups.disabled = false;
+        }, 1500);
       }
     });
   }
@@ -686,6 +738,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // ------------------------------------------------------------- Features Logic
   async function loadFeatures() {
+    if (btnRunFeatureRec) {
+      btnRunFeatureRec.disabled = true;
+      btnRunFeatureRec.classList.add('btn-loading');
+      btnRunFeatureRec.innerHTML = '<span class="btn-spinner"></span> Recognizing Features...';
+    }
     try {
       const res = await fetch('/api/recognize-features', { method: 'POST' });
       const data = await res.json();
@@ -693,6 +750,12 @@ document.addEventListener('DOMContentLoaded', () => {
       renderFeaturesList(data.features);
     } catch (err) {
       console.error('Failed to recognize features:', err);
+    } finally {
+      if (btnRunFeatureRec) {
+        btnRunFeatureRec.disabled = false;
+        btnRunFeatureRec.classList.remove('btn-loading');
+        btnRunFeatureRec.innerHTML = '🔍 Run Feature Recognition';
+      }
     }
   }
 
@@ -841,7 +904,24 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  async function loadOperations() {
+  if (btnReplanOperations) {
+    btnReplanOperations.addEventListener('click', () => loadOperations(true));
+  }
+
+  async function loadOperations(force = false) {
+    if (btnReplanOperations) {
+      btnReplanOperations.disabled = true;
+      btnReplanOperations.classList.add('btn-loading');
+      btnReplanOperations.innerHTML = '<span class="btn-spinner"></span> Planning...';
+    }
+    if (opListContainer && (!state.plannedOps || state.plannedOps.length === 0)) {
+      opListContainer.innerHTML = `
+        <div class="text-center p-3" style="color: var(--text-dim); font-size: 0.85rem;">
+          <span class="btn-spinner" style="margin-right: 6px;"></span> Planning machining operations across setups...
+        </div>
+      `;
+    }
+
     try {
       const res = await fetch('/api/plan-operations', {
         method: 'POST',
@@ -849,8 +929,13 @@ document.addEventListener('DOMContentLoaded', () => {
         body: JSON.stringify({ stock: state.stock }),
       });
       if (!res.ok) {
-        const err = await res.json();
-        alert(`Operation Planning Notice:\n${err.detail || 'Failed to plan operations'}`);
+        let errMsg = 'Failed to plan operations';
+        try {
+          const err = await res.json();
+          errMsg = err.detail || errMsg;
+        } catch (_) {}
+        console.error('Operation Planning Notice:', errMsg);
+        renderOpsList([]);
         return;
       }
       const data = await res.json();
@@ -957,11 +1042,32 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     } catch (err) {
       console.error('Failed to plan operations:', err);
+      renderOpsList([]);
+    } finally {
+      if (btnReplanOperations) {
+        btnReplanOperations.disabled = false;
+        btnReplanOperations.classList.remove('btn-loading');
+        btnReplanOperations.innerHTML = '&#9889; Plan Operations';
+      }
     }
   }
 
   function renderOpsList(ops) {
     opListContainer.innerHTML = '';
+    if (!ops || ops.length === 0) {
+      opListContainer.innerHTML = `
+        <div class="card p-3 text-center" style="background: rgba(255, 255, 255, 0.02); border: 1px dashed var(--border-color); border-radius: 8px;">
+          <div style="font-size: 0.82rem; color: var(--text-dim); margin-bottom: 8px;">No planned machining operations.</div>
+          <button id="btn-replan-ops-empty" class="btn btn-xs btn-primary" style="margin: 0 auto;">
+            &#9889; Plan Machining Operations
+          </button>
+        </div>
+      `;
+      const btn = opListContainer.querySelector('#btn-replan-ops-empty');
+      if (btn) btn.addEventListener('click', () => loadOperations(true));
+      return;
+    }
+
     ops.forEach((op, index) => {
       const item = document.createElement('div');
       item.className = 'op-card-item';
