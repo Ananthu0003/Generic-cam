@@ -5,11 +5,14 @@ Pure functions — no FastAPI coupling.  Extracted from the old ``utils.py``.
 
 from __future__ import annotations
 
-from typing import Union
+from typing import Union, TYPE_CHECKING
 import numpy as np
 
 from ...context import Stock, StockKind, Fixture
 from ..schemas import StockConfig
+
+if TYPE_CHECKING:
+    from ..state import SetupConfig
 
 
 def create_stock_from_config(
