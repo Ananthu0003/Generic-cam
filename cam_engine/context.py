@@ -117,6 +117,11 @@ class ToolType(str, Enum):
     REAMER = "reamer"
     THREAD_MILL = "thread_mill"
     GROOVE_CUTTER = "groove_cutter"
+    V_BIT = "v_bit"                        # V-carving / engraving bit
+    DOVETAIL_CUTTER = "dovetail_cutter"    # Dovetail & undercut milling cutter
+    SLITTING_SAW = "slitting_saw"          # Slitting / slotting saw
+    TOUCH_PROBE = "touch_probe"            # Electronic touch probe (Renishaw / Blum)
+
 
 
 class DepthReference(str, Enum):
@@ -708,11 +713,19 @@ class Stock:
 
     @property
     def radius(self) -> Optional[float]:
-        return self.cylinder_radius
+        if self.cylinder_radius is not None and self.cylinder_radius > 0:
+            return float(self.cylinder_radius)
+        if self.bounds_min is not None and self.bounds_max is not None:
+            return float(0.5 * min(self.bounds_max[0] - self.bounds_min[0], self.bounds_max[1] - self.bounds_min[1]))
+        return None
 
     @property
     def center_xy(self) -> Optional[np.ndarray]:
-        return self.cylinder_center
+        if self.cylinder_center is not None:
+            return self.cylinder_center
+        if self.bounds_min is not None and self.bounds_max is not None:
+            return 0.5 * (self.bounds_min[:2] + self.bounds_max[:2])
+        return None
 
     def dimension_description(self) -> str:
         """Format stock dimensions for reports and setup sheets."""

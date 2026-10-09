@@ -39,7 +39,9 @@ from ..toolpaths.semantic import MotionSegment, MotionType, Toolpath
 
 # --------------------------------------------------------------------- text --
 def fmt_number(val: float, precision: int = 3) -> str:
-    """Format a coordinate for a controller (trailing zeros stripped)."""
+    """Format a coordinate for a controller (trailing zeros stripped, no negative zero)."""
+    if round(val, precision) == 0.0 or abs(val) < 1e-9:
+        val = 0.0
     s = f"{val:.{precision}f}"
     return s.rstrip("0").rstrip(".") if "." in s else s
 
@@ -796,6 +798,12 @@ class ProgramBuilder:
             spindle_rpm=rpm if self.o.tool_change_spindle_restart else None,
         ))
         self.current_tool_id = tool_id
+        if rpm is not None and self.o.tool_change_spindle_restart:
+            self.current_spindle = rpm
+            self.spindle_active = True
+        else:
+            self.current_spindle = None
+            self.spindle_active = False
         self.established = False
         if tool_id not in self.stats.tool_changes:
             self.stats.tool_changes.append(tool_id)
@@ -818,8 +826,6 @@ class ProgramBuilder:
         return None
 
     def _tool_change_rpm(self, tool_meta: Optional[dict], target_op_rpm: Optional[float]) -> Optional[float]:
-        if self.current_spindle and self.current_spindle > 0:
-            return float(self.current_spindle)
         rule = self.o.tool_change_rpm_rule
         if rule == "spindle_or_tool":
             if target_op_rpm and target_op_rpm > 0:
@@ -829,6 +835,12 @@ class ProgramBuilder:
             cp = tool_meta.get("cutting_parameters") if tool_meta else None
             if isinstance(cp, dict) and cp.get("spindle_rpm"):
                 return float(cp["spindle_rpm"])
+        if target_op_rpm and target_op_rpm > 0:
+            return float(target_op_rpm)
+        if tool_meta and tool_meta.get("spindle_rpm"):
+            return float(tool_meta["spindle_rpm"])
+        if self.current_spindle and self.current_spindle > 0:
+            return float(self.current_spindle)
         return self.o.default_tool_change_rpm
 
     # ------------------------------------------------------------ programs --
@@ -977,7 +989,7 @@ class ProgramBuilder:
         cmds.append(SafetyBlock(str(wcs), tool_number=t_num, h_offset=h_offset))
 
         if target_op_rpm and target_op_rpm > 0:
-            if tool_changed or not self.spindle_active or self.current_spindle != target_op_rpm:
+            if not self.spindle_active or self.current_spindle != target_op_rpm:
                 cmds.append(Spindle(float(target_op_rpm), source="operation"))
                 self.current_spindle = target_op_rpm
                 self.spindle_active = True

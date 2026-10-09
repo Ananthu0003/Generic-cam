@@ -128,6 +128,8 @@ class GeometryDrivenToolSelector:
             permissible_types = [ToolType.COUNTERSINK_TOOL, ToolType.CHAMFER_MILL]
         elif purpose_lower == "grooving":
             permissible_types = [ToolType.GROOVE_CUTTER, ToolType.FLAT_ENDMILL]
+        elif purpose_lower == "filleting":
+            permissible_types = [ToolType.BALL_ENDMILL, ToolType.BULLNOSE_ENDMILL]
         elif purpose_lower in ("finishing", "semi_finishing", "rest_machining"):
             if ftype in (FeatureType.FREEFORM_SURFACE, FeatureType.FILLET):
                 permissible_types = [ToolType.BALL_ENDMILL, ToolType.BULLNOSE_ENDMILL, ToolType.FLAT_ENDMILL]
@@ -198,14 +200,24 @@ class GeometryDrivenToolSelector:
             corner_r = float(feature.radius)
         elif feature.notes.get("corner_radius") is not None:
             corner_r = float(feature.notes["corner_radius"])
+        elif feature.boundary_loop and len(feature.boundary_loop) >= 8 and purpose_lower in ("finishing", "semi_finishing"):
+            pts = np.asarray(feature.boundary_loop, dtype=float)
+            diffs = np.diff(pts[:, :2], axis=0)
+            seg_lens = np.linalg.norm(diffs, axis=1)
+            valid_lens = seg_lens[seg_lens > 0.05]
+            if len(valid_lens) > 0:
+                min_seg = float(np.min(valid_lens))
+                if min_seg < 3.0:
+                    corner_r = max(min_seg * 1.5, 1.0)
+
 
         requires_corner_fit = bool(
             corner_r is not None
-            and is_internal
             and purpose_lower in ("finishing", "semi_finishing", "rest_machining")
             and purpose_lower not in ("spot_drilling", "countersinking", "chamfering")
         )
         max_corner_radius = corner_r if requires_corner_fit else None
+
 
         # 7. Maximum Allowed Tool Diameter Calculation
         # Base ceiling: default to large capacity unless constrained by geometry
@@ -252,14 +264,19 @@ class GeometryDrivenToolSelector:
         # External scale constraint (bosses, contours, facing)
         # Prevents selecting giant cutters on tiny features
         if not is_internal and ftype not in (FeatureType.FACING_REGION, FeatureType.CONTOUR):
-            external_bound = max(min_span * 3.0, 4.0) if min_span < 1e6 else 50.0
-            if self.setup and getattr(self.setup, "stock", None) is not None:
-                stk = self.setup.stock
-                if stk.bounds_min is not None and stk.bounds_max is not None:
-                    stk_span = float(np.min(np.abs(stk.bounds_max[:2] - stk.bounds_min[:2])))
-                    if stk_span > 1e-3:
-                        external_bound = min(external_bound, max(stk_span * 1.5, 4.0))
+            if ftype == FeatureType.BOSS:
+                external_bound = max(min_span * 0.8, 1.5) if min_span < 1e6 else 50.0
+            else:
+                external_bound = max(min_span * 2.0, 3.0) if min_span < 1e6 else 50.0
+                if self.setup and getattr(self.setup, "stock", None) is not None:
+                    stk = self.setup.stock
+                    if stk.bounds_min is not None and stk.bounds_max is not None:
+                        stk_span = float(np.min(np.abs(stk.bounds_max[:2] - stk.bounds_min[:2])))
+                        if stk_span > 1e-3:
+                            external_bound = min(external_bound, max(stk_span * 1.5, 4.0))
             max_allowed_dia = min(max_allowed_dia, external_bound)
+
+
 
         # 8. Minimum Recommended Tool Diameter & Ideal Range
         if ftype in (FeatureType.HOLE, FeatureType.BLIND_HOLE, FeatureType.THROUGH_HOLE, FeatureType.TAPPED_HOLE):

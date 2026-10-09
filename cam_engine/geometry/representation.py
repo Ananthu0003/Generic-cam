@@ -111,8 +111,13 @@ class NominalCadBoundary:
         new_outer = transform_points(self.outer_loop, t) if len(self.outer_loop) > 0 else self.outer_loop.copy()
         new_islands = [transform_points(loop, t) for loop in self.island_loops]
         new_z = None
-        if self.z_level is not None and len(new_outer) > 0:
-            new_z = float(new_outer[0, 2])
+        if self.z_level is not None:
+            if len(new_outer) > 0 and new_outer.ndim == 2 and new_outer.shape[1] >= 3:
+                new_z = float(new_outer[0, 2])
+            else:
+                pt_z = np.array([0.0, 0.0, float(self.z_level)])
+                new_z = float((pt_z @ t[:3, :3].T + t[:3, 3])[2])
+
         return NominalCadBoundary(
             outer_loop=new_outer,
             island_loops=new_islands,
@@ -209,7 +214,16 @@ class ToolpathBoundary:
         t = np.asarray(transform_matrix, dtype=float)
         new_contour = transform_points(self.contour, t) if len(self.contour) > 0 else self.contour.copy()
         new_islands = [transform_points(c, t) for c in self.island_contours]
-        new_z = float(new_contour[0, 2]) if len(new_contour) > 0 else self.z_level
+        new_z = None
+        if self.z_level is not None:
+            if len(new_contour) > 0 and new_contour.ndim == 2 and new_contour.shape[1] >= 3:
+                new_z = float(new_contour[0, 2])
+            else:
+                pt_z = np.array([0.0, 0.0, float(self.z_level)])
+                new_z = float((pt_z @ t[:3, :3].T + t[:3, 3])[2])
+        elif len(new_contour) > 0 and new_contour.ndim == 2 and new_contour.shape[1] >= 3:
+            new_z = float(new_contour[0, 2])
+
         return ToolpathBoundary(
             contour=new_contour,
             island_contours=new_islands,

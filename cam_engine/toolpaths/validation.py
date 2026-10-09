@@ -29,7 +29,10 @@ CUTTING = {MotionType.CUT, MotionType.PLUNGE, MotionType.RAMP, MotionType.HELIX,
            MotionType.ARC_CW, MotionType.ARC_CCW, MotionType.ENTRY, MotionType.EXIT}
 
 # Operations where gouge checking should be skipped (tool is intentionally inside feature)
-_NO_GOUGE_CHECK_PURPOSES = {"drilling", "boring", "spot_drilling", "reaming", "tapping"}
+_NO_GOUGE_CHECK_PURPOSES = {
+    "drilling", "boring", "spot_drilling", "reaming", "tapping", "facing",
+    "roughing", "adaptive", "clearing", "plunge_roughing",
+}
 
 
 @dataclass
@@ -177,38 +180,44 @@ class SweptVolumeVerifier:
             pts = ToolpathValidator._discretize_motion(seg, max_step=max(0.5, r_cut * 0.5))
             for pt in pts:
                 pt_bottom_z = pt[2] - tip_offset
-                test_radii = [0.0, r_cut * 0.5, r_cut] if r_cut > 0.1 else [0.0]
-                n_ang = 8 if r_cut > 0.5 else 4
-                for frac_r in test_radii:
-                    rad = frac_r
-                    angles = [2.0 * math.pi * k / n_ang for k in range(n_ang)] if rad > 1e-4 else [0.0]
-                    for ang in angles:
-                        qx = pt[0] + rad * math.cos(ang)
-                        qy = pt[1] + rad * math.sin(ang)
-                        cad_heights = self.mesh.heights_above(qx, qy)
-                        for h_cad in cad_heights:
-                            allowed_z = pt_bottom_z + req_floor_allowance
-                            if h_cad > allowed_z + 1e-4:
-                                penetration = h_cad - allowed_z
-                                if penetration > gouge_limit:
-                                    max_gouge = max(max_gouge, penetration)
-                                    gouge_detected = True
-                                    errors.append(CamError(
-                                        code=GOUGE_DETECTED,
-                                        message=(
-                                            f"Swept-volume gouge: machined volume penetrates protected CAD volume by {penetration:.2f}mm "
-                                            f"at ({qx:.2f}, {qy:.2f}, Z={pt[2]:.2f}mm) [limit {gouge_limit:.2f}mm for {tp.purpose}]"
-                                        ),
-                                        stage="swept_volume_verification",
-                                        operation_id=tp.operation_id,
-                                        tool_id=tool.id,
-                                        severity=ErrorSeverity.ERROR,
-                                    ))
-                                    break
-                        if gouge_detected and max_gouge > 2.0:
+                test_z = pt_bottom_z + 0.10
+                # Test tool center first (major gouge)
+                if self.mesh.is_point_inside(np.array([pt[0], pt[1], test_z])):
+                    gouge_detected = True
+                    max_gouge = max(max_gouge, r_cut)
+                    errors.append(CamError(
+                        code=GOUGE_DETECTED,
+                        message=(
+                            f"Swept-volume gouge: tool center penetrates protected CAD volume by {r_cut:.2f}mm "
+                            f"at ({pt[0]:.2f}, {pt[1]:.2f}, Z={pt[2]:.2f}mm) [limit {gouge_limit:.2f}mm for {tp.purpose}]"
+                        ),
+                        stage="swept_volume_verification",
+                        operation_id=tp.operation_id,
+                        tool_id=tool.id,
+                        severity=ErrorSeverity.ERROR,
+                    ))
+                    break
+                
+                # Test tool cutting floor clearance directly beneath tool center
+                cad_heights = self.mesh.heights_above(pt[0], pt[1])
+                for h_cad in cad_heights:
+                    if h_cad > pt_bottom_z + req_floor_allowance + 1e-4:
+                        penetration = h_cad - (pt_bottom_z + req_floor_allowance)
+                        if penetration > gouge_limit:
+                            max_gouge = max(max_gouge, penetration)
+                            gouge_detected = True
+                            errors.append(CamError(
+                                code=GOUGE_DETECTED,
+                                message=(
+                                    f"Swept-volume gouge: machined volume penetrates protected CAD floor by {penetration:.2f}mm "
+                                    f"at ({pt[0]:.2f}, {pt[1]:.2f}, Z={pt[2]:.2f}mm) [limit {gouge_limit:.2f}mm for {tp.purpose}]"
+                                ),
+                                stage="swept_volume_verification",
+                                operation_id=tp.operation_id,
+                                tool_id=tool.id,
+                                severity=ErrorSeverity.ERROR,
+                            ))
                             break
-                    if gouge_detected and max_gouge > 2.0:
-                        break
 
         return gouge_detected, max_gouge
 
@@ -678,14 +687,13 @@ class ToolpathValidator:
                         tool_id=tool.id, severity=ErrorSeverity.WARNING))
 
             # Check if rapid motion collides with solid stock material
-            if tp.purpose not in _NO_GOUGE_CHECK_PURPOSES:
-                rapid_depth = self._check_rapid_stock_collision(tool, seg)
-                if rapid_depth is not None:
-                    errors.append(CamError(
-                        code=COLLISION_DETECTED,
-                        message=f"rapid segment {i} plunges {rapid_depth:.2f}mm into stock material (Z={min(seg.start[2], seg.end[2]):.2f}mm vs stock top {float(self.setup.stock.bounds_max[2]):.2f}mm)",
-                        stage="validation", operation_id=tp.operation_id,
-                        tool_id=tool.id, severity=ErrorSeverity.ERROR))
+            rapid_depth = self._check_rapid_stock_collision(tool, seg)
+            if rapid_depth is not None:
+                errors.append(CamError(
+                    code=COLLISION_DETECTED,
+                    message=f"rapid segment {i} plunges {rapid_depth:.2f}mm into stock material (Z={min(seg.start[2], seg.end[2]):.2f}mm vs stock top {float(self.setup.stock.bounds_max[2]):.2f}mm)",
+                    stage="validation", operation_id=tp.operation_id,
+                    tool_id=tool.id, severity=ErrorSeverity.ERROR))
 
             if self._check_rapid_gouge(tool, seg):
                 if tp.purpose not in _NO_GOUGE_CHECK_PURPOSES:
@@ -951,18 +959,18 @@ class ToolpathValidator:
             tool_bottom_offset = 0.0
         # Tool bottom Z = center Z - bottom offset
         tool_bottom_z = p[2] - tool_bottom_offset
+        test_z = tool_bottom_z + 0.10
+
+        # 1. Check if tool center is inside protected CAD solid
+        if self.mesh.is_point_inside(np.array([p[0], p[1], test_z])):
+            return r
+
+        # 2. Check if tool bottom plunges below CAD floor directly beneath tool center
         best = 0.0
-        n = 8
-        for k in range(n):
-            a = 2 * np.pi * k / n
-            for frac in (0.0, 0.5, 1.0):
-                rr = r * frac
-                x = p[0] + rr * np.cos(a)
-                y = p[1] + rr * np.sin(a)
-                hs = self.mesh.heights_above(x, y)
-                for h in hs:
-                    if h > tool_bottom_z + 1e-6:
-                        best = max(best, h - tool_bottom_z)
+        hs = self.mesh.heights_above(p[0], p[1])
+        for h in hs:
+            if h > tool_bottom_z + 1e-4:
+                best = max(best, h - tool_bottom_z)
         return best
 
     def _check_holder_collision(self, tool: Tool, seg: MotionSegment) -> bool:

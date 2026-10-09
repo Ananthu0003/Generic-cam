@@ -9,6 +9,12 @@ from .post_processor import (
     HeidenhainPostProcessor,
     SiemensPostProcessor,
     SinumerikPostProcessor,
+    Mach3Mach4PostProcessor,
+    CentroidPostProcessor,
+    MassoPostProcessor,
+    MarlinPostProcessor,
+    SmoothiePostProcessor,
+    UccncPostProcessor,
     get_post_processor,
     PostResult,
 )

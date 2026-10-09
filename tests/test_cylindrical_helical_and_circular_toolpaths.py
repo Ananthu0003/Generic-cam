@@ -172,3 +172,101 @@ def test_circular_boss_contouring_toolpath_structure():
     assert "G40" in gcode or "G3" in gcode
     assert "I" in gcode
     assert "J" in gcode
+
+
+def test_cylindrical_stock_facing():
+    """Verify facing on cylindrical stock generates circular ARC_CW/ARC_CCW passes, not square raster."""
+    strat_ctx = make_test_context()
+    # Configure cylindrical stock
+    cyl_stock = Stock.from_cylinder(center_xy=np.array([50.0, 50.0]), z_min=-10.0, z_max=30.0, radius=25.0)
+    strat_ctx.setup.stock = cyl_stock
+    engine = StrategyEngine(strat_ctx)
+    tool = strat_ctx.context.tools[0]  # 10mm endmill
+
+    facing_feature = MachiningFeature(
+        id="facing_cyl",
+        type=FeatureType.FACING_REGION,
+        face_indices=[0],
+        bounds_min=np.array([25.0, 25.0, 28.0]),
+        bounds_max=np.array([75.0, 75.0, 30.0]),
+        depth=2.0,
+        top_z=30.0,
+        floor_z=28.0,
+        diameter=50.0,
+        is_concave=False,
+        notes={"is_circular": True, "center_xy": [50.0, 50.0]},
+    )
+    params = CuttingParameters(
+        spindle_rpm=5000.0, feed_rate=1200.0, plunge_feed=400.0, ramp_feed=600.0,
+        feed_per_tooth_mm=0.06, depth_of_cut_mm=2.0, stepover_mm=5.0, coolant=True,
+        effective_diameter_mm=10.0, engagement_angle_deg=45.0, power_kw=1.0, torque_nm=2.0,
+    )
+    op = PlannedOperation(
+        id="op_facing_cyl",
+        purpose=OpPurpose.FACING,
+        feature=facing_feature,
+        tool=tool,
+        params=params,
+    )
+
+    tp = engine.generate(op)
+    # Check that circular arc moves were generated
+    arc_segs = [s for s in tp.segments if s.motion_type in (MotionType.ARC_CW, MotionType.ARC_CCW)]
+    assert len(arc_segs) > 0, "Facing on cylindrical stock must generate circular arc moves, not square raster"
+    for s in arc_segs:
+        assert s.arc_center is not None, "Arc segments must have arc_center defined"
+
+
+def test_cylindrical_outer_contour_roughing_and_finishing():
+    """Verify outer contour of a cylindrical part is identified as circular and uses circular roughing/finishing."""
+    strat_ctx = make_test_context()
+    engine = StrategyEngine(strat_ctx)
+    tool = strat_ctx.context.tools[0]
+
+    cyl_contour = MachiningFeature(
+        id="contour_outer",
+        type=FeatureType.CONTOUR,
+        face_indices=[0],
+        bounds_min=np.array([20.0, 20.0, 0.0]),
+        bounds_max=np.array([80.0, 80.0, 25.0]),
+        depth=25.0,
+        top_z=25.0,
+        floor_z=0.0,
+        diameter=60.0,
+        radius=30.0,
+        is_concave=False,
+        notes={"perimeter": True, "outer_contour": True, "is_circular": True, "center_xy": [50.0, 50.0]},
+        surface_type="cylinder",
+    )
+    params = CuttingParameters(
+        spindle_rpm=5000.0, feed_rate=1500.0, plunge_feed=500.0, ramp_feed=800.0,
+        feed_per_tooth_mm=0.06, depth_of_cut_mm=5.0, stepover_mm=4.0, coolant=True,
+        effective_diameter_mm=10.0, engagement_angle_deg=45.0, power_kw=1.5, torque_nm=3.0,
+    )
+    # 1. Roughing operation
+    op_rough = PlannedOperation(
+        id="op_cyl_rough",
+        purpose=OpPurpose.ROUGHING,
+        feature=cyl_contour,
+        tool=tool,
+        params=params,
+    )
+    tp_rough = engine.generate(op_rough)
+    assert tp_rough.metadata.get("strategy") == "boss_circular_roughing"
+    rough_arcs = [s for s in tp_rough.segments if s.motion_type in (MotionType.ARC_CW, MotionType.ARC_CCW)]
+    assert len(rough_arcs) > 0, "Cylindrical contour roughing must use circular arc passes"
+
+    # 2. Finishing operation
+    op_finish = PlannedOperation(
+        id="op_cyl_finish",
+        purpose=OpPurpose.FINISHING,
+        feature=cyl_contour,
+        tool=tool,
+        params=params,
+        notes={"cutter_comp": True},
+    )
+    tp_finish = engine.generate(op_finish)
+    assert tp_finish.metadata.get("strategy") == "circular_boss_contour"
+    finish_arcs = [s for s in tp_finish.segments if s.motion_type in (MotionType.ARC_CW, MotionType.ARC_CCW)]
+    assert len(finish_arcs) > 0, "Cylindrical contour finishing must use circular arc passes"
+

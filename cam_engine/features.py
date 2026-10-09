@@ -8,6 +8,7 @@ Every recognized feature carries semantic data, topological evidence, and proven
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -243,6 +244,13 @@ class MachiningFeature:
         top_pt = transform_points(np.array([[mid_xy[0], mid_xy[1], self.top_z]]), t)[0]
         floor_pt = transform_points(np.array([[mid_xy[0], mid_xy[1], self.floor_z]]), t)[0]
 
+        # In setup space, tool approaches along +Z towards -Z.
+        # Thus the entry/material top is the higher Z, and the floor is the lower Z.
+        z1 = float(top_pt[2])
+        z2 = float(floor_pt[2])
+        setup_top_z = max(z1, z2)
+        setup_floor_z = min(z1, z2)
+
         feat_id = new_id or self.id
         canon_id = self.canonical_id or self.id
 
@@ -255,8 +263,8 @@ class MachiningFeature:
             bounds_min=new_bmin,
             bounds_max=new_bmax,
             depth=float(self.depth),
-            top_z=float(top_pt[2]),
-            floor_z=float(floor_pt[2]),
+            top_z=setup_top_z,
+            floor_z=setup_floor_z,
             axis=new_axis,
             diameter=self.diameter,
             radius=self.radius,
@@ -276,8 +284,8 @@ class MachiningFeature:
             island_loops=new_island_loops,
             surface_type=self.surface_type,
             center=new_center,
-            axial_start=float(top_pt[2]) if self.axial_start is not None else None,
-            axial_end=float(floor_pt[2]) if self.axial_end is not None else None,
+            axial_start=setup_top_z if self.axial_start is not None else None,
+            axial_end=setup_floor_z if self.axial_end is not None else None,
             fillet_radius=self.fillet_radius,
             orientation=new_orientation,
             tolerances=self.tolerances,
@@ -525,10 +533,13 @@ class FeatureRecognizer:
             })
 
         # Step 2: Classify bosses directly
-        # Step 2: Classify bosses directly
         for info in cyl_info:
             if not info["is_internal"]:
+                # Partial external rounds / corner fillets (< 165 deg) are corner rounds, not standalone bosses
+                if info["total_u_span"] < np.pi - 0.25:
+                    continue
                 bmin = np.array([info["center_xy"][0] - info["radius"], info["center_xy"][1] - info["radius"], info["bottom_z"]])
+
                 bmax = np.array([info["center_xy"][0] + info["radius"], info["center_xy"][1] + info["radius"], info["top_z"]])
                 cyl_center = np.array([info["center_xy"][0], info["center_xy"][1], 0.5 * (info["top_z"] + info["bottom_z"])])
                 out.append(MachiningFeature(
@@ -837,6 +848,8 @@ class FeatureRecognizer:
                 if float(np.linalg.norm(ef.center_xy - centre_xy)) < 1.5:
                     parent_id = ef.id
                     break
+            if parent_id is None:
+                continue
             csink_id = f"csink_{cf.index}"
             csink_center = np.array([centre_xy[0], centre_xy[1], 0.5 * (top_z + bottom_z)])
             out.append(MachiningFeature(
@@ -1341,14 +1354,34 @@ class FeatureRecognizer:
         wall_faces = [f.index for f in self.faces if self._tags.get(f.index) in ("wall", "slanted", "cylinder")]
 
         boundary_loop: Optional[list[np.ndarray]] = None
+        # Look for the outer wire of a face that matches the overall bounding box extent
         for f in self.faces:
-            if self._tags.get(f.index) in ("top", "bottom"):
-                for w in f.wires:
-                    if w.is_outer and len(w.points) >= 3:
-                        boundary_loop = [p[:2].copy() for p in w.points]
-                        break
+            if self._tags.get(f.index) in ("top", "bottom", "step_floor"):
+                f_extent = f.bounds_max[:2] - f.bounds_min[:2]
+                if abs(f_extent[0] - extent[0]) < 0.5 and abs(f_extent[1] - extent[1]) < 0.5:
+                    for w in f.wires:
+                        if w.is_outer and len(w.points) >= 3:
+                            boundary_loop = [p[:2].copy() for p in w.points]
+                            break
             if boundary_loop is not None:
                 break
+
+        if boundary_loop is None:
+            # Monotone chain 2D convex hull
+            pts_2d = sorted({(round(float(p[0]), 3), round(float(p[1]), 3)) for p in all_pts})
+            if len(pts_2d) >= 3:
+                lower: list[tuple[float, float]] = []
+                for p in pts_2d:
+                    while len(lower) >= 2 and (lower[-1][0] - lower[-2][0]) * (p[1] - lower[-2][1]) - (lower[-1][1] - lower[-2][1]) * (p[0] - lower[-2][0]) <= 1e-7:
+                        lower.pop()
+                    lower.append(p)
+                upper: list[tuple[float, float]] = []
+                for p in reversed(pts_2d):
+                    while len(upper) >= 2 and (upper[-1][0] - upper[-2][0]) * (p[1] - upper[-2][1]) - (upper[-1][1] - upper[-2][1]) * (p[0] - upper[-2][0]) <= 1e-7:
+                        upper.pop()
+                    upper.append(p)
+                hull = lower[:-1] + upper[:-1]
+                boundary_loop = [np.array([p[0], p[1]], dtype=float) for p in hull]
 
         if boundary_loop is None:
             boundary_loop = [
@@ -1358,8 +1391,38 @@ class FeatureRecognizer:
                 np.array([bmin[0], bmax[1]]),
             ]
 
+
         contour_center = np.array([0.5 * (bmin[0] + bmax[0]), 0.5 * (bmin[1] + bmax[1]), 0.5 * (self._model_top_z + model_bottom_z)])
         target_faces = wall_faces if wall_faces else [f.index for f in self.faces]
+
+        # Check if outer boundary is circular/cylindrical
+        is_circular = False
+        dia: Optional[float] = None
+        rad: Optional[float] = None
+        if abs(extent[0] - extent[1]) < 0.2 and extent[0] > 0.1:
+            mean_r = 0.5 * (extent[0] + extent[1]) / 2.0
+            if boundary_loop and len(boundary_loop) >= 6:
+                dists = [float(np.linalg.norm(p[:2] - contour_center[:2])) for p in boundary_loop]
+                if float(np.std(dists)) < 0.08 * mean_r:
+                    is_circular = True
+            elif wall_faces and all(self._tags.get(idx) in ("cylinder", "revolved") or getattr(self.faces[idx], "surface_type", "") == "cylinder" for idx in wall_faces):
+                is_circular = True
+            elif getattr(self, "_is_revolved_model", False):
+                is_circular = True
+
+            if is_circular:
+                dia = float((extent[0] + extent[1]) / 2.0)
+                rad = float(dia / 2.0)
+                n_pts = 64
+                boundary_loop = [
+                    np.array([contour_center[0] + rad * math.cos(a), contour_center[1] + rad * math.sin(a)])
+                    for a in np.linspace(0, 2 * math.pi, n_pts, endpoint=False)
+                ]
+
+        notes = {"perimeter": True, "outer_contour": True}
+        if is_circular:
+            notes["is_circular"] = True
+            notes["center_xy"] = [float(contour_center[0]), float(contour_center[1])]
 
         out.append(MachiningFeature(
             id="contour_outer",
@@ -1371,20 +1434,22 @@ class FeatureRecognizer:
             top_z=self._model_top_z,
             floor_z=model_bottom_z,
             axis=self.tool_axis.copy(),
+            diameter=dia,
+            radius=rad,
             is_concave=False,
             accessibility=Accessibility.TOOL_AXIS_OK,
             wall_faces=wall_faces,
             boundary_loop=boundary_loop,
             source_edges=self._edges_for_faces(target_faces),
             tolerances=self._tolerance_for_faces(target_faces),
-            notes={"perimeter": True, "outer_contour": True},
+            notes=notes,
             recognition_evidence=[
                 "outer_part_boundary_profile",
                 f"depth_{depth:.2f}",
                 f"bounds_min_{bmin[0]:.1f}_{bmin[1]:.1f}",
                 f"bounds_max_{bmax[0]:.1f}_{bmax[1]:.1f}",
             ],
-            surface_type="contour",
+            surface_type="cylinder" if is_circular else "contour",
             center=contour_center,
             axial_start=self._model_top_z,
             axial_end=model_bottom_z,
@@ -1441,6 +1506,10 @@ class FeatureRecognizer:
             # Determine pure-revolution flag from the primary (largest area) axis
             if axis_idx == 0 and profile.is_pure_revolution:
                 is_pure_revolution = True
+
+            # Only generate turned revolved profiles for true rotationally-symmetric / turned parts
+            if not profile.is_pure_revolution:
+                continue
 
             axis_tag = f"rev{axis_idx}"
             all_face_ids = sorted(set(
@@ -1714,31 +1783,14 @@ class FeatureRecognizer:
         if not len(mesh.triangles):
             return Accessibility.INACCESSIBLE
 
-        worst = Accessibility.TOOL_AXIS_OK
-
         # If explicit top opening sample points are provided (for holes/bores/pockets)
         if top_sample_pts:
             for p in top_sample_pts:
                 hit = mesh.ray_first_hit(p + self.tool_axis * 1e-3, self.tool_axis, max_dist=1e4)
                 if hit is not None and hit > 1e-4:
                     return Accessibility.INACCESSIBLE
+            return Accessibility.TOOL_AXIS_OK
 
-            # Check if any face normal requires tilted tool axis
-            for fi in face_ids:
-                f = self.faces[fi]
-                if f.surface.kind == SurfaceKind.CYLINDER and f.surface.axis is not None:
-                    axis = f.surface.axis / max(np.linalg.norm(f.surface.axis), 1e-12)
-                    if abs(float(axis @ self.tool_axis)) > 0.85:
-                        # Vertical cylinder aligned with tool axis (normal is radial, OK)
-                        continue
-                face_normal = f.oriented_normal
-                if face_normal is not None:
-                    cos_angle = abs(np.dot(face_normal, self.tool_axis))
-                    if cos_angle < np.cos(np.radians(self._vertical_tol_deg)):
-                        worst = Accessibility.NEEDS_TILTED_TOOL
-            return worst
-
-        worst = Accessibility.TOOL_AXIS_OK
         for fi in face_ids:
             f = self.faces[fi]
             pts = f.triangles.reshape(-1, 3)
@@ -1748,19 +1800,7 @@ class FeatureRecognizer:
                 if hit is not None and hit > 1e-4:
                     return Accessibility.INACCESSIBLE
 
-            # Check if face normal requires tilted tool axis
-            if f.surface.kind == SurfaceKind.CYLINDER and f.surface.axis is not None:
-                axis = f.surface.axis / max(np.linalg.norm(f.surface.axis), 1e-12)
-                if abs(float(axis @ self.tool_axis)) > 0.85:
-                    # Vertical cylinder aligned with tool axis (normal is radial, OK)
-                    continue
-            face_normal = f.oriented_normal
-            if face_normal is not None:
-                cos_angle = abs(np.dot(face_normal, self.tool_axis))
-                # If face normal is more than vertical_tol_deg from tool axis and not a vertical wall
-                if cos_angle < np.cos(np.radians(self._vertical_tol_deg)):
-                    worst = Accessibility.NEEDS_TILTED_TOOL
-        return worst
+        return Accessibility.TOOL_AXIS_OK
 
     def _dedupe_and_sort(self, features: list[MachiningFeature]) -> list[MachiningFeature]:
         seen: set[str] = set()

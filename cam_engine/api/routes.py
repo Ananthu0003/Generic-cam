@@ -618,6 +618,21 @@ def auto_generate_setups(request: Request):
             ))
             offset_idx += 1
 
+        # Determine all faces covered by Top and Bottom setups to avoid redundant side setups
+        covered_face_indices = set()
+        try:
+            rec_top = FeatureRecognizer(shape, stock_top_z=float(bmax_orig[2]) + 1.0)
+            for f in rec_top.recognize():
+                covered_face_indices.update(f.face_indices)
+
+            s2_shape = shape.transformed(_euler_to_matrix(180.0, 0.0, 0.0))
+            _, s2_bmax = s2_shape.bounding_box()
+            rec_bot = FeatureRecognizer(s2_shape, stock_top_z=float(s2_bmax[2]) + 1.0)
+            for f in rec_bot.recognize():
+                covered_face_indices.update(f.face_indices)
+        except Exception:
+            pass
+
         # Candidate side directions with proper setup rotation angles mapping to +Z tool axis
         side_candidates = [
             {
@@ -657,60 +672,42 @@ def auto_generate_setups(request: Request):
             sign = cand["sign"]
             outer_coord = bmax_orig[ax_idx] if sign > 0 else bmin_orig[ax_idx]
 
-            # 1. Check for cylinders (holes / bores / bosses) aligned with or located on this side
-            for f in faces:
+            # 1. Check for true horizontal cylinders (holes / bores) along this approach direction
+            for i, f in enumerate(faces):
                 if f.surface.kind is SurfaceKind.CYLINDER and f.surface.axis is not None:
                     axis = f.surface.axis / max(float(np.linalg.norm(f.surface.axis)), 1e-12)
-                    if abs(float(axis @ dir_vec)) > 0.7:
+                    # Axis must align with side approach vector (drilled horizontally from this side)
+                    if abs(float(axis @ dir_vec)) > 0.85:
                         if f.surface.point_on is not None:
                             p_coord = float(f.surface.point_on[ax_idx])
                             mid_coord = 0.5 * (bmin_orig[ax_idx] + bmax_orig[ax_idx])
-                            if (sign > 0 and p_coord >= mid_coord - 2.0) or (sign < 0 and p_coord <= mid_coord + 2.0):
+                            if (sign > 0 and p_coord >= mid_coord - 1.0) or (sign < 0 and p_coord <= mid_coord + 1.0):
                                 has_feature = True
                                 break
                         else:
                             has_feature = True
                             break
-                    elif abs(axis[2]) < 0.3:
-                        if f.surface.point_on is not None:
-                            p_coord = float(f.surface.point_on[ax_idx])
-                            mid_coord = 0.5 * (bmin_orig[ax_idx] + bmax_orig[ax_idx])
-                            if (sign > 0 and p_coord > mid_coord + 1.0) or (sign < 0 and p_coord < mid_coord - 1.0):
-                                has_feature = True
-                                break
 
-            # 2. Check for recessed planar faces pointing along approach direction (pocket/step/slot floors)
+            # 2. Check for recessed planar faces pointing along approach direction (pocket/slot floors)
+            # that are true undercuts (enclosed above and below in Z, not machinable from +Z or -Z)
             if not has_feature:
-                for f in faces:
+                for i, f in enumerate(faces):
                     if f.surface.kind is SurfaceKind.PLANE and f.oriented_normal is not None:
                         norm = f.oriented_normal / max(float(np.linalg.norm(f.oriented_normal)), 1e-12)
                         dot_norm = float(norm @ dir_vec)
-                        if dot_norm > 0.85:
+                        if dot_norm > 0.85 and f.area > 5.0:
                             f_center_coord = float(f.center[ax_idx]) if f.center is not None else outer_coord
-                            is_recessed = abs(f_center_coord - outer_coord) > 0.5
-                            if is_recessed and f.area > 5.0:
-                                has_feature = True
-                                break
-
-            # 3. Transform and run FeatureRecognizer in candidate setup space to detect slots/steps/features
-            if not has_feature:
-                try:
-                    rot_mat = _euler_to_matrix(*cand["rot"])
-                    setup_shape = shape.transformed(rot_mat)
-                    sbmin, sbmax = setup_shape.bounding_box()
-                    rec = FeatureRecognizer(setup_shape, stock_top_z=float(sbmax[2]) + 1.0)
-                    cand_feats = rec.recognize()
-                    actionable_types = {
-                        FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE,
-                        FeatureType.THROUGH_BORE, FeatureType.BLIND_BORE,
-                        FeatureType.CHAMFER_HOLE, FeatureType.POCKET,
-                        FeatureType.SLOT, FeatureType.STEP,
-                        FeatureType.CIRCULAR_BOSS
-                    }
-                    if any(f.type in actionable_types for f in cand_feats):
-                        has_feature = True
-                except Exception:
-                    pass
+                            is_recessed = abs(f_center_coord - outer_coord) > 1.0
+                            if is_recessed and f.bounds_max is not None and f.bounds_min is not None:
+                                # True undercut: has solid material above it (+Z) and below it (-Z)
+                                has_ceiling = f.bounds_max[2] < bmax_orig[2] - 0.5
+                                has_floor = f.bounds_min[2] > bmin_orig[2] + 0.5
+                                if has_ceiling and has_floor:
+                                    # Verify this face is on the correct side of the workpiece
+                                    mid_coord = 0.5 * (bmin_orig[ax_idx] + bmax_orig[ax_idx])
+                                    if (sign > 0 and f_center_coord >= mid_coord - 1.0) or (sign < 0 and f_center_coord <= mid_coord + 1.0):
+                                        has_feature = True
+                                        break
 
             if has_feature and offset_idx < len(offsets):
                 setups.append(SetupConfig(
@@ -1229,6 +1226,15 @@ def generate_toolpaths(request: Request, req: GenerateToolpathsRequest):
         if not sess.planned_ops:
             plan_operations(request, PlanOpsRequest(stock=req.stock))
 
+        if req.dressups:
+            for op in sess.planned_ops:
+                if req.dressups.get("holding_tabs"):
+                    op.notes["holding_tabs"] = True
+                    op.notes["tab_count"] = int(req.dressups.get("tab_count", 4))
+                    op.notes["tab_height"] = float(req.dressups.get("tab_height", 2.0))
+                if req.dressups.get("dogbone"):
+                    op.notes["dogbone"] = True
+
         ctx, setups = _build_context_and_setups(sess, req.stock)
         all_toolpaths: list[Toolpath] = []
         total_cut_len = 0.0
@@ -1410,6 +1416,10 @@ def generate_gcode(request: Request, req: PostProcessRequest):
     """Post-processes generated toolpaths into controller-specific CNC G-code with multi-setup support."""
     sess = _get_session(request)
     try:
+        if not sess.features:
+            recognize_features(request)
+        if not sess.planned_ops:
+            plan_operations(request, PlanOpsRequest(stock=sess.stock_config))
         if not sess.toolpaths:
             generate_toolpaths(request, GenerateToolpathsRequest(stock=sess.stock_config))
 

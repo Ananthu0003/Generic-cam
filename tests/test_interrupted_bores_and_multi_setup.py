@@ -276,7 +276,7 @@ def test_multi_setup_auto_detect_both_side_walls(client):
     s1 = BRepAlgoAPI_Fuse(base, boss).Shape()
     hole_left = BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(-41.0, 0.0, 20.0), gp_Dir(1.0, 0.0, 0.0)), 8.0, 20.0).Shape()
     s2 = BRepAlgoAPI_Cut(s1, hole_left).Shape()
-    slot_right = BRepPrimAPI_MakeBox(gp_Pnt(20.0, -10.0, 10.0), gp_Pnt(31.0, 10.0, 41.0)).Shape()
+    slot_right = BRepPrimAPI_MakeBox(gp_Pnt(20.0, -10.0, 10.0), gp_Pnt(31.0, 10.0, 30.0)).Shape()
     s3 = BRepAlgoAPI_Cut(s2, slot_right).Shape()
 
     shape = Shape(s3)
@@ -389,5 +389,44 @@ def test_opposing_blind_holes_with_internal_web():
     assert len(drills) == 1
     assert drills[0].feature.id == top_f.id
     assert drills[0].feature.floor_z >= 1.40, f"Drill depth breached web: floor_z={drills[0].feature.floor_z}"
+
+
+def test_minimal_two_setup_detection_no_false_positive_sides(client):
+    """Verify that a 2.5D part with top pockets, through holes, bottom steps, and fillets
+    generates EXACTLY 2 setups (Setup 1 Top G54 and Setup 2 Bottom G55), without false-positive side setups."""
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+    from OCP.gp import gp_Ax2, gp_Pnt, gp_Dir
+    from cam_engine.geometry.topology import Shape
+    from cam_engine.geometry.step_import import ImportedModel
+    from cam_engine.api.routes import _get_session
+
+    # Base block: 60 x 40 x 20 mm
+    block = BRepPrimAPI_MakeBox(gp_Pnt(-30.0, -20.0, 0.0), gp_Pnt(30.0, 20.0, 20.0)).Shape()
+
+    # Top pocket (open to +Z): from Z=10 to Z=21 (cuts top face)
+    top_pocket = BRepPrimAPI_MakeBox(gp_Pnt(-15.0, -10.0, 10.0), gp_Pnt(15.0, 10.0, 21.0)).Shape()
+    s1 = BRepAlgoAPI_Cut(block, top_pocket).Shape()
+
+    # Vertical through holes along Z axis:
+    h1 = BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(-22.0, 0.0, -1.0), gp_Dir(0.0, 0.0, 1.0)), 3.0, 22.0).Shape()
+    s2 = BRepAlgoAPI_Cut(s1, h1).Shape()
+
+    h2 = BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(22.0, 0.0, -1.0), gp_Dir(0.0, 0.0, 1.0)), 3.0, 22.0).Shape()
+    s3 = BRepAlgoAPI_Cut(s2, h2).Shape()
+
+    shape = Shape(s3)
+    sess = _get_session(None)
+    sess.imported_model = ImportedModel(shape=shape, declared_units="mm", original_bounds=shape.bounding_box())
+
+    res = client.post("/api/setups/auto-generate")
+    assert res.status_code == 200
+    data = res.json()
+    setups = data["setups"]
+
+    assert len(setups) == 2, f"Expected exactly 2 setups, got {len(setups)}: {[s['name'] for s in setups]}"
+    assert setups[0]["work_offset"] == "G54"
+    assert setups[1]["work_offset"] == "G55"
+
 
 

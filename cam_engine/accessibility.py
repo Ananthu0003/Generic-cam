@@ -232,9 +232,12 @@ class AccessibilityAnalyzer:
             u_tool_approach = np.array([0.0, 0.0, 1.0])
 
         # Feature approach direction
-        feat_dir = feature.axis if feature.axis is not None else feature.machining_direction
+        feat_dir = feature.axis if feature.axis is not None else (
+            feature.orientation if feature.orientation is not None else getattr(feature, "machining_direction", None)
+        )
         if feat_dir is None:
             feat_dir = np.array([0.0, 0.0, 1.0])
+
         feat_dir = np.asarray(feat_dir, dtype=float)
         norm_f = float(np.linalg.norm(feat_dir))
         if norm_f > 1e-6:
@@ -265,14 +268,18 @@ class AccessibilityAnalyzer:
                 )
                 machine_req = MachineAxisRequirement.FIVE_AXIS_INDEXED
         else:
-            # Planar / pocket / contour features: tool approach must oppose or align with surface normal
-            if feature.type in (FeatureType.FACING_REGION, FeatureType.POCKET, FeatureType.OPEN_POCKET, FeatureType.SLOT):
-                if dot_align < 0.70:
+            # Planar / pocket / contour / chamfer / fillet / step features: tool approach must align with surface normal / approach
+            if feature.type in (
+                FeatureType.FACING_REGION, FeatureType.POCKET, FeatureType.OPEN_POCKET,
+                FeatureType.SLOT, FeatureType.CHAMFER, FeatureType.FILLET, FeatureType.STEP,
+            ):
+                if dot_align < 0.20:
                     optical_access = False
                     rejection_reasons.append(
                         f"Machining direction {feat_dir.tolist()} misaligned with setup approach {u_tool_approach.tolist()} (dot={dot_align:.3f})"
                     )
                     machine_req = MachineAxisRequirement.FOUR_AXIS_ROTARY if abs(dot_align) < 0.2 else MachineAxisRequirement.FIVE_AXIS_INDEXED
+
 
         # Ray casting occlusion check in setup space
         if canonical_mesh is not None and len(canonical_mesh.triangles) > 0 and optical_access:

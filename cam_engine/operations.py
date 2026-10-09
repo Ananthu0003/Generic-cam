@@ -28,6 +28,7 @@ from .context import (
     Tool,
     ToolType,
 )
+from .coords import CoordSpace
 from .errors import CamError, FEATURE_INACCESSIBLE, UNSUPPORTED_FEATURE
 from .features import (Accessibility, FeatureRecognizer, FeatureType,
                        MachiningFeature)
@@ -627,6 +628,9 @@ class OperationPlanner:
         rough_ops = [o for o in prior if o.purpose is OpPurpose.ROUGHING]
         for rough in rough_ops:
             f = rough.feature
+            # Rest machining only applies to concave internal cavity features with internal corners
+            if not f.is_concave or f.type in (FeatureType.CONTOUR, FeatureType.BOSS, FeatureType.FACING_REGION, FeatureType.PLANAR_WALL):
+                continue
             req = self._req(f)
             if not req.accessible:
                 continue
@@ -658,6 +662,8 @@ class OperationPlanner:
         rough_ops = [o for o in prior if o.purpose is OpPurpose.ROUGHING]
         for rough in rough_ops:
             f = rough.feature
+            if not f.is_concave or f.type in (FeatureType.CONTOUR, FeatureType.BOSS, FeatureType.FACING_REGION, FeatureType.PLANAR_WALL):
+                continue
             req = self._req(f)
             if not req.accessible:
                 continue
@@ -692,9 +698,8 @@ class OperationPlanner:
             extent = f.xy_extent
             if f.type is FeatureType.CONTOUR and float(max(extent) if len(extent) else 0.0) < 1e-6:
                 continue
-            # A toroidal blend with a known radius is finished by the dedicated
-            # 3D filleting pass instead of a plain contour finish.
-            if f.type is FeatureType.FILLET and self._fillet_tool(f) is not None:
+            # Fillets are handled exclusively by the dedicated _plan_filleting() pass
+            if f.type is FeatureType.FILLET:
                 continue
             req = self._req(f)
             # Required surface + stock condition: finish only what still has
@@ -1023,6 +1028,7 @@ class OperationPlanner:
 
     def _plan_chamfering(self) -> list[PlannedOperation]:
         ops: list[PlannedOperation] = []
+        seen_chamfers = set()
         for f in self.features:
             if f.type is not FeatureType.CHAMFER:
                 continue
@@ -1032,6 +1038,18 @@ class OperationPlanner:
             demanded, reason = req.demands_surface_pass(OpPurpose.CHAMFERING.value)
             if not demanded:
                 continue
+            # Deduplicate duplicate/split chamfer features at the exact same location & radius
+            center_key = (
+                round(float(f.bounds_min[0] + f.bounds_max[0]) / 2.0, 2),
+                round(float(f.bounds_min[1] + f.bounds_max[1]) / 2.0, 2),
+                round(float(f.floor_z if f.floor_z is not None else (f.bounds_min[2] if len(f.bounds_min) > 2 else 0.0)), 2),
+                round(float(f.notes.get("r_start") or 0.0), 2),
+                round(float(f.notes.get("r_end") or 0.0), 2),
+            )
+            if center_key in seen_chamfers:
+                continue
+            seen_chamfers.add(center_key)
+
             res = self.tool_selector.select_optimal_tool(f, "chamfering", self.context.tools)
             tool = res.selected_tool if res.success else self._pick_finishing_tool(f)
             if tool is None:
@@ -1059,25 +1077,39 @@ class OperationPlanner:
         """Tool able to cut the toroidal blend of a FILLET feature.
 
         Requires corner_radius >= fillet_radius so the tool geometry can fully
-        engage the blend arc.  Returns None when no such tool exists.
+        engage the blend arc. Returns None when no such tool exists.
+        Only ball-nose and bull-nose endmills are permitted (never face mills).
         """
-        if f.fillet_radius is None or f.fillet_radius <= 0.0:
+        fillet_r = f.fillet_radius if (f.fillet_radius is not None and f.fillet_radius > 0.0) else f.radius
+        if fillet_r is None or fillet_r <= 0.0:
             return None
-        fillet_r = f.fillet_radius
+        allowed_types = (ToolType.BALL_ENDMILL, ToolType.BULLNOSE_ENDMILL)
+        candidates = [t for t in self.context.tools if t.type in allowed_types]
+        if not candidates:
+            return None
+
+        # Check maximum diameter bounds if feature has an extent limit
+        extent = f.xy_extent
+        max_tool_dia = float(max(extent)) * 2.0 if len(extent) and float(max(extent)) > 1e-4 else 1e9
+
+        valid_candidates = [t for t in candidates if t.diameter <= max_tool_dia]
+        if not valid_candidates:
+            valid_candidates = candidates
+
         best_tool = None
-        for t in sorted(self.context.tools, key=lambda t: t.diameter):
-            corner_r = getattr(t, "corner_radius", 0.0) or 0.0
+        for t in sorted(valid_candidates, key=lambda t: t.diameter):
+            corner_r = getattr(t, "corner_radius", 0.0) or getattr(t, "tip_radius", 0.0) or (t.diameter / 2.0 if t.type is ToolType.BALL_ENDMILL else 0.0)
             if corner_r >= fillet_r - 1e-3:
                 best_tool = t
                 break
         if best_tool is None:
             # Fall back to smallest ball-nose / bull-nose available
-            candidates = [
-                t for t in self.context.tools
-                if getattr(t, "corner_radius", 0.0) and t.diameter / 2.0 >= fillet_r
+            radius_fits = [
+                t for t in valid_candidates
+                if (getattr(t, "corner_radius", 0.0) or getattr(t, "tip_radius", 0.0) or t.diameter / 2.0) and (t.diameter / 2.0 >= fillet_r - 1e-3)
             ]
-            if candidates:
-                best_tool = min(candidates, key=lambda t: t.diameter)
+            if radius_fits:
+                best_tool = min(radius_fits, key=lambda t: t.diameter)
         return best_tool
 
     def _plan_filleting(self) -> list[PlannedOperation]:
@@ -1095,14 +1127,14 @@ class OperationPlanner:
                 continue
             if f.accessibility is Accessibility.INACCESSIBLE:
                 continue
-            if f.fillet_radius is None or f.fillet_radius <= 0.0:
+            fillet_r = f.fillet_radius if (f.fillet_radius is not None and f.fillet_radius > 0.0) else f.radius
+            if fillet_r is None or fillet_r <= 0.0:
                 continue
             req = self._req(f)
             demanded, reason = req.demands_surface_pass(OpPurpose.FILLETING.value)
             if not demanded:
                 continue
 
-            fillet_r = f.fillet_radius
             best_tool = self._fillet_tool(f)
             if best_tool is None:
                 self.warnings.append({
@@ -1135,6 +1167,7 @@ class OperationPlanner:
 
     def _plan_countersinking(self) -> list[PlannedOperation]:
         ops: list[PlannedOperation] = []
+        seen_countersinks = set()
         for f in self.features:
             if f.type is not FeatureType.COUNTERSINK:
                 continue
@@ -1142,6 +1175,17 @@ class OperationPlanner:
                 continue
             if f.accessibility is Accessibility.INACCESSIBLE:
                 continue
+            # Deduplicate concentric countersinks at same location & depth
+            center_key = (
+                round(float(f.bounds_min[0] + f.bounds_max[0]) / 2.0, 2),
+                round(float(f.bounds_min[1] + f.bounds_max[1]) / 2.0, 2),
+                round(float(f.floor_z if f.floor_z is not None else (f.bounds_min[2] if len(f.bounds_min) > 2 else 0.0)), 2),
+                round(float(f.diameter or 0.0), 2),
+            )
+            if center_key in seen_countersinks:
+                continue
+            seen_countersinks.add(center_key)
+
             res = self.tool_selector.select_optimal_tool(f, "countersinking", self.context.tools)
             if not res.success or res.selected_tool is None:
                 continue

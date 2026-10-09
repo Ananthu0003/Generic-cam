@@ -160,6 +160,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const viewResetBtn = document.getElementById('view-reset');
 
   // HUD Readouts
+  const hudSetup = document.getElementById('hud-setup');
   const hudSpindle = document.getElementById('hud-spindle');
   const hudFeed = document.getElementById('hud-feed');
   const hudTool = document.getElementById('hud-tool');
@@ -179,8 +180,11 @@ document.addEventListener('DOMContentLoaded', () => {
       loadSetups();
     } else if (stepNum === 3 && state.features.length === 0) {
       loadFeatures();
-    } else if (stepNum === 4 && state.plannedOps.length === 0) {
-      loadOperations();
+    } else if (stepNum === 4) {
+      loadToolsAndOps();
+      if (state.plannedOps.length === 0) {
+        loadOperations();
+      }
     } else if (stepNum === 5) {
       if (state.toolpaths.length === 0) {
         generateToolpaths();
@@ -203,6 +207,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Sync simulation telemetry with HUD
   viewer.onProgressUpdate = (info) => {
+    if (hudSetup && (info.setup_name || info.work_offset)) {
+      hudSetup.textContent = info.work_offset ? `${info.work_offset} (${info.setup_name || ''})` : (info.setup_name || 'Setup 1');
+    }
     hudSpindle.textContent = `${Math.round(info.spindle)} RPM`;
     hudFeed.textContent = `${Math.round(info.feed)} mm/min`;
     hudTool.textContent = info.tool || '--';
@@ -264,6 +271,7 @@ document.addEventListener('DOMContentLoaded', () => {
     state.toolpaths = [];
     state.gcodeResult = null;
     loadSetups();
+    loadToolsAndOps();
   }
 
   async function orientModel(axis, angleDeg) {
@@ -825,7 +833,20 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function renderToolsList(tools) {
+    if (!toolListContainer) return;
     toolListContainer.innerHTML = '';
+    if (!tools || !Array.isArray(tools) || tools.length === 0) {
+      toolListContainer.innerHTML = `
+        <div style="padding: 16px; text-align: center; color: var(--text-dim); font-size: 0.85rem; border: 1px dashed rgba(255,255,255,0.1); border-radius: 8px;">
+          No active tools. <button id="btn-reload-default-tools" class="btn btn-sm btn-primary" style="margin-left: 8px; font-size:0.75rem; padding:3px 10px;">Load Defaults</button>
+        </div>
+      `;
+      const reloadBtn = toolListContainer.querySelector('#btn-reload-default-tools');
+      if (reloadBtn) {
+        reloadBtn.addEventListener('click', loadToolsAndOps);
+      }
+      return;
+    }
     tools.forEach((t) => {
       const item = document.createElement('div');
       item.className = 'tool-card-item';
@@ -1113,15 +1134,34 @@ document.addEventListener('DOMContentLoaded', () => {
     viewer.setSimulationProgress(0);
   }
 
+  const chkHoldingTabs = document.getElementById('chk-holding-tabs');
+  const chkDogboneCorners = document.getElementById('chk-dogbone-corners');
+  const holdingTabsOpts = document.getElementById('holding-tabs-opts');
+  const tabCountInput = document.getElementById('tab-count');
+  const tabHeightInput = document.getElementById('tab-height');
+
+  if (chkHoldingTabs && holdingTabsOpts) {
+    chkHoldingTabs.addEventListener('change', () => {
+      holdingTabsOpts.style.display = chkHoldingTabs.checked ? 'grid' : 'none';
+    });
+  }
+
   async function generateToolpaths() {
     btnGenerateToolpaths.disabled = true;
     btnGenerateToolpaths.innerHTML = 'Calculating Multi-Setup Paths...';
+
+    const dressups = {
+      holding_tabs: Boolean(chkHoldingTabs?.checked),
+      tab_count: parseInt(tabCountInput?.value || '4'),
+      tab_height: parseFloat(tabHeightInput?.value || '2.0'),
+      dogbone: Boolean(chkDogboneCorners?.checked),
+    };
 
     try {
       const res = await fetch('/api/generate-toolpaths', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ stock: state.stock, all_setups: true }),
+        body: JSON.stringify({ stock: state.stock, all_setups: true, dressups: dressups }),
       });
       if (!res.ok) {
         const err = await res.json();

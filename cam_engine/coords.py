@@ -131,12 +131,22 @@ def dataclass_field_default() -> np.ndarray:
 
 
 def transform_points(points: np.ndarray, t: np.ndarray) -> np.ndarray:
-    """Apply 4x4 transform to an (N,3) array of points."""
+    """Apply 4x4 transform to an (N,3), (N,2), (3,), or (2,) array of points."""
     p = np.asarray(points, dtype=float)
     if p.size == 0:
         return p.reshape(0, 3)
+    was_1d = (p.ndim == 1)
+    if was_1d:
+        p = p.reshape(1, -1)
+    is_2d = (p.shape[1] == 2)
+    if is_2d:
+        p = np.column_stack([p, np.zeros(len(p), dtype=float)])
     r, tr = t[:3, :3], t[:3, 3]
-    return p @ r.T + tr
+    res = p @ r.T + tr
+    if is_2d:
+        res = res[:, :2]
+    return res[0] if was_1d else res
+
 
 
 def transform_direction(vec: np.ndarray, t: np.ndarray) -> np.ndarray:

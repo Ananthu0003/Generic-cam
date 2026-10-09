@@ -260,6 +260,7 @@ class GenerateToolpathsRequest(BaseModel):
     work_offset: str = "G54"
     setup_id: Optional[str] = None
     all_setups: bool = False
+    dressups: Optional[dict[str, Any]] = None
 
 
 class GenerateToolpathsResponse(BaseModel):

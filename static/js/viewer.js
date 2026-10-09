@@ -47,9 +47,9 @@ class Cam3DViewer {
     this.toolCatalog = {};
     this.currentSimToolId = null;
 
-    // Dynamic stock heightfield grid
-    this.gridNX = 120;
-    this.gridNY = 120;
+    // Dynamic stock heightfield grid (optimized 64x64 for fast real-time 60fps carving)
+    this.gridNX = 64;
+    this.gridNY = 64;
     this.stockHeights = null;
     this.initialStockHeights = null;
     this.stockGeom = null;
@@ -694,7 +694,7 @@ class Cam3DViewer {
     if (this.clampZoneGroup) this.clampZoneGroup.visible = (this.fixtureVisible !== undefined ? this.fixtureVisible : true);
   }
 
-  carveSegmentIntoArrays(p0_setup, p1_setup, toolRadius, invRotMatrix, topHeights, botHeights) {
+  carveSegmentIntoArrays(p0_setup, p1_setup, toolRadius, invRotMatrix, topHeights, botHeights, precomputedApproach = null) {
     if (!this.rawStockBounds || !topHeights || !botHeights) return;
 
     const min = this.rawStockBounds.min;
@@ -706,69 +706,87 @@ class Cam3DViewer {
     const dx = sx / (NX - 1);
     const dy = sy / (NY - 1);
 
-    // Transform points from Setup frame to Part local frame
-    const p0 = p0_setup.clone().applyMatrix4(invRotMatrix);
-    const p1 = p1_setup.clone().applyMatrix4(invRotMatrix);
+    // Direct matrix transform without heap object allocation
+    const m = invRotMatrix.elements;
+    const x0 = p0_setup.x !== undefined ? p0_setup.x : p0_setup[0];
+    const y0 = p0_setup.y !== undefined ? p0_setup.y : p0_setup[1];
+    const z0 = p0_setup.z !== undefined ? p0_setup.z : p0_setup[2];
+    const p0x = m[0] * x0 + m[4] * y0 + m[8] * z0 + m[12];
+    const p0y = m[1] * x0 + m[5] * y0 + m[9] * z0 + m[13];
+    const p0z = m[2] * x0 + m[6] * y0 + m[10] * z0 + m[14];
 
-    // Spindle vector in Part local frame
-    const spindleSetup = new THREE.Vector3(0, 0, 1);
-    const pZero = new THREE.Vector3(0, 0, 0).applyMatrix4(invRotMatrix);
-    const spindlePart = spindleSetup.clone().applyMatrix4(invRotMatrix).sub(pZero).normalize();
+    const x1 = p1_setup.x !== undefined ? p1_setup.x : p1_setup[0];
+    const y1 = p1_setup.y !== undefined ? p1_setup.y : p1_setup[1];
+    const z1 = p1_setup.z !== undefined ? p1_setup.z : p1_setup[2];
+    const p1x = m[0] * x1 + m[4] * y1 + m[8] * z1 + m[12];
+    const p1y = m[1] * x1 + m[5] * y1 + m[9] * z1 + m[13];
+    const p1z = m[2] * x1 + m[6] * y1 + m[10] * z1 + m[14];
 
-    const isTopApproach = spindlePart.z > 0.4;
-    const isBotApproach = spindlePart.z < -0.4;
+    let isTopApproach = true;
+    let isBotApproach = false;
+    if (precomputedApproach) {
+      isTopApproach = precomputedApproach.isTop;
+      isBotApproach = precomputedApproach.isBot;
+    } else {
+      const spz = m[10]; // spindle (0, 0, 1) transformed z component (m33 in Three.js column-major Matrix4)
+      isTopApproach = spz > 0.4;
+      isBotApproach = spz < -0.4;
+    }
 
-    const minCutX = Math.min(p0.x, p1.x) - toolRadius;
-    const maxCutX = Math.max(p0.x, p1.x) + toolRadius;
-    const minCutY = Math.min(p0.y, p1.y) - toolRadius;
-    const maxCutY = Math.max(p0.y, p1.y) + toolRadius;
+    const minCutX = Math.min(p0x, p1x) - toolRadius;
+    const maxCutX = Math.max(p0x, p1x) + toolRadius;
+    const minCutY = Math.min(p0y, p1y) - toolRadius;
+    const maxCutY = Math.max(p0y, p1y) + toolRadius;
 
     const iMin = Math.max(0, Math.floor((minCutX - min[0]) / dx));
     const iMax = Math.min(NX - 1, Math.ceil((maxCutX - min[0]) / dx));
     const jMin = Math.max(0, Math.floor((minCutY - min[1]) / dy));
     const jMax = Math.min(NY - 1, Math.ceil((maxCutY - min[1]) / dy));
 
-    const segVecX = p1.x - p0.x;
-    const segVecY = p1.y - p0.y;
+    if (iMin > iMax || jMin > jMax) return;
+
+    const segVecX = p1x - p0x;
+    const segVecY = p1y - p0y;
     const segLenSq = segVecX * segVecX + segVecY * segVecY;
     const rSq = toolRadius * toolRadius;
+    const invSegLenSq = segLenSq > 1e-6 ? 1.0 / segLenSq : 0;
 
     for (let j = jMin; j <= jMax; j++) {
       const gy = min[1] + j * dy;
+      const jRow = j * NX;
       for (let i = iMin; i <= iMax; i++) {
         const gx = min[0] + i * dx;
         let t = 0;
-        if (segLenSq > 1e-6) {
-          t = Math.max(0, Math.min(1, ((gx - p0.x) * segVecX + (gy - p0.y) * segVecY) / segLenSq));
+        if (invSegLenSq > 0) {
+          t = ((gx - p0x) * segVecX + (gy - p0y) * segVecY) * invSegLenSq;
+          if (t < 0) t = 0;
+          else if (t > 1) t = 1;
         }
-        const nx = p0.x + t * segVecX;
-        const ny = p0.y + t * segVecY;
+        const nx = p0x + t * segVecX;
+        const ny = p0y + t * segVecY;
         const dSq = (gx - nx) * (gx - nx) + (gy - ny) * (gy - ny);
 
         if (dSq <= rSq) {
-          const zTool = segLenSq <= 1e-6 ? Math.min(p0.z, p1.z) : (p0.z + t * (p1.z - p0.z));
-          const gridIdx = j * NX + i;
+          const zTool = invSegLenSq === 0 ? Math.min(p0z, p1z) : (p0z + t * (p1z - p0z));
+          const gridIdx = jRow + i;
 
           if (isTopApproach) {
-            // Cut into top surface
             if (zTool < topHeights[gridIdx]) {
-              topHeights[gridIdx] = Math.max(min[2], zTool);
+              topHeights[gridIdx] = zTool > min[2] ? zTool : min[2];
               if (topHeights[gridIdx] < botHeights[gridIdx]) {
                 botHeights[gridIdx] = topHeights[gridIdx];
               }
             }
           } else if (isBotApproach) {
-            // Cut into bottom surface (Flip 180°)
             if (zTool > botHeights[gridIdx]) {
-              botHeights[gridIdx] = Math.min(max[2], zTool);
+              botHeights[gridIdx] = zTool < max[2] ? zTool : max[2];
               if (botHeights[gridIdx] > topHeights[gridIdx]) {
                 topHeights[gridIdx] = botHeights[gridIdx];
               }
             }
           } else {
-            // Side approach
             if (zTool < topHeights[gridIdx] && zTool > botHeights[gridIdx]) {
-              topHeights[gridIdx] = Math.max(min[2], zTool);
+              topHeights[gridIdx] = zTool > min[2] ? zTool : min[2];
             }
           }
         }
@@ -779,6 +797,9 @@ class Cam3DViewer {
   computeAllSetupSnapshots(setups = [], allToolpaths = []) {
     if (!this.rawStockBounds || !this.initialTopHeights || !this.initialBotHeights) return;
     this.setupSnapshots = {};
+    this.allSetups = setups;
+    this.allSetupsMap = {};
+    setups.forEach(s => { this.allSetupsMap[s.id] = s; });
 
     let currentTop = new Float32Array(this.initialTopHeights);
     let currentBot = new Float32Array(this.initialBotHeights);
@@ -804,6 +825,12 @@ class Cam3DViewer {
       const rz = THREE.MathUtils.degToRad(rotDeg[2] || 0);
       const rotMatrix = new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(rx, ry, rz, 'XYZ'));
       const invRotMatrix = rotMatrix.clone().invert();
+      const m = invRotMatrix.elements;
+      const spz = m[10]; // m33 in Three.js column-major Matrix4
+      const precomputedApproach = {
+        isTop: spz > 0.4,
+        isBot: spz < -0.4,
+      };
 
       setupPaths.forEach((tp) => {
         let toolRadius = 5.0;
@@ -814,14 +841,12 @@ class Cam3DViewer {
 
         tp.segments?.forEach((seg) => {
           if (cuttingTypes.has(seg.motion_type)) {
-            const p0 = new THREE.Vector3(seg.start[0], seg.start[1], seg.start[2]);
-            const p1 = new THREE.Vector3(seg.end[0], seg.end[1], seg.end[2]);
             let r = toolRadius;
             if (seg.tool_id && this.toolCatalog[seg.tool_id]) {
               const dia = this.toolCatalog[seg.tool_id].diameter;
               if (dia && dia > 0) r = dia / 2.0;
             }
-            this.carveSegmentIntoArrays(p0, p1, r, invRotMatrix, currentTop, currentBot);
+            this.carveSegmentIntoArrays(seg.start, seg.end, r, invRotMatrix, currentTop, currentBot, precomputedApproach);
           }
         });
       });
@@ -857,12 +882,6 @@ class Cam3DViewer {
       this.lastCarvedDistance = 0;
     }
 
-    const rx = THREE.MathUtils.degToRad(this.currentSetupRotation[0] || 0);
-    const ry = THREE.MathUtils.degToRad(this.currentSetupRotation[1] || 0);
-    const rz = THREE.MathUtils.degToRad(this.currentSetupRotation[2] || 0);
-    const rotMatrix = new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(rx, ry, rz, 'XYZ'));
-    const invRotMatrix = rotMatrix.clone().invert();
-
     let accumulatedDist = 0;
 
     for (let sIdx = 0; sIdx < this.animSegments.length; sIdx++) {
@@ -885,6 +904,7 @@ class Cam3DViewer {
           const p0 = new THREE.Vector3().lerpVectors(seg.start, seg.end, sliceStartFrac);
           const p1 = new THREE.Vector3().lerpVectors(seg.start, seg.end, sliceEndFrac);
 
+          const invRotMatrix = seg.inv_rot_matrix || this.defaultInvRotMatrix || new THREE.Matrix4();
           this.carveSegmentIntoArrays(p0, p1, toolRadius, invRotMatrix, this.currentTopHeights, this.currentBotHeights);
         }
       }
@@ -897,6 +917,16 @@ class Cam3DViewer {
     this.updateStockMeshGeometry();
   }
 
+  showSetupToolpaths(setupId) {
+    if (!this.setupToolpathGroups) return;
+    Object.keys(this.setupToolpathGroups).forEach(sId => {
+      const grp = this.setupToolpathGroups[sId];
+      if (grp) {
+        grp.visible = (setupId === 'all' || sId === setupId);
+      }
+    });
+  }
+
   renderToolpaths(toolpathList, activeSetupId = 'all', allSetups = [], fullToolpathList = []) {
     this.toolpathGroup.clear();
     this.toolpaths = toolpathList;
@@ -906,6 +936,11 @@ class Cam3DViewer {
     this.currentAnimDistance = 0;
     this.lastCarvedDistance = 0;
     this.totalEstSeconds = 0;
+    this.currentSimSetupId = null;
+
+    this.allSetups = allSetups || [];
+    this.allSetupsMap = {};
+    this.allSetups.forEach(s => { this.allSetupsMap[s.id] = s; });
 
     // Precompute / ensure setup snapshots exist across all setups
     if (allSetups && allSetups.length > 0) {
@@ -925,11 +960,23 @@ class Cam3DViewer {
       this.updateStockMeshGeometry();
     }
 
-    const cutVerts = [];
-    const rapidVerts = [];
-    const plungeVerts = [];
+    this.setupToolpathGroups = {};
+    const perSetupVerts = {};
 
     toolpathList.forEach((tp) => {
+      const sId = tp.setup_id || tp.metadata?.setup_id || tp.notes?.setup_id || (allSetups?.[0]?.id || 'setup_001');
+      const setupObj = this.allSetupsMap[sId] || allSetups?.[0] || { rotation_deg: [0, 0, 0] };
+      const rotDeg = setupObj.rotation_deg || [0, 0, 0];
+      const rx = THREE.MathUtils.degToRad(rotDeg[0] || 0);
+      const ry = THREE.MathUtils.degToRad(rotDeg[1] || 0);
+      const rz = THREE.MathUtils.degToRad(rotDeg[2] || 0);
+      const rotMatrix = new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(rx, ry, rz, 'XYZ'));
+      const invRotMatrix = rotMatrix.clone().invert();
+
+      if (!perSetupVerts[sId]) {
+        perSetupVerts[sId] = { cut: [], rapid: [], plunge: [] };
+      }
+
       tp.segments.forEach((seg) => {
         const s = seg.start;
         const e = seg.end;
@@ -943,6 +990,11 @@ class Cam3DViewer {
 
         this.animSegments.push({
           segment_id: seg.segment_id,
+          setup_id: sId,
+          setup_obj: setupObj,
+          rot_deg: rotDeg,
+          inv_rot_matrix: invRotMatrix,
+          rot_matrix: rotMatrix,
           operation_id: seg.operation_id || tp.operation_id,
           feature_id: seg.feature_id || tp.feature_id,
           source_face_ids: seg.source_face_ids || tp.source_face_ids || [],
@@ -961,70 +1013,72 @@ class Cam3DViewer {
         this.totalAnimDistance += len;
 
         if (seg.motion_type === 'rapid' || seg.motion_type === 'link' || seg.motion_type === 'retract') {
-          rapidVerts.push(s[0], s[1], s[2], e[0], e[1], e[2]);
+          perSetupVerts[sId].rapid.push(s[0], s[1], s[2], e[0], e[1], e[2]);
         } else if (seg.motion_type === 'plunge' || seg.motion_type === 'ramp') {
-          plungeVerts.push(s[0], s[1], s[2], e[0], e[1], e[2]);
+          perSetupVerts[sId].plunge.push(s[0], s[1], s[2], e[0], e[1], e[2]);
         } else {
-          cutVerts.push(s[0], s[1], s[2], e[0], e[1], e[2]);
+          perSetupVerts[sId].cut.push(s[0], s[1], s[2], e[0], e[1], e[2]);
         }
       });
     });
 
-    // Debug: log segment type distribution
-    const typeCounts = {};
-    this.animSegments.forEach(s => { typeCounts[s.type] = (typeCounts[s.type] || 0) + 1; });
-    console.log('renderToolpaths: segment types:', typeCounts);
-    console.log('renderToolpaths: total segments:', this.animSegments.length, 'total distance:', this.totalAnimDistance.toFixed(2));
-    console.log('renderToolpaths: stock bounds:', this.stockBounds);
-    console.log('renderToolpaths: tool catalog keys:', Object.keys(this.toolCatalog));
+    // Build sub-groups per setup
+    Object.keys(perSetupVerts).forEach((sId) => {
+      const sGrp = new THREE.Group();
+      sGrp.name = `toolpaths_${sId}`;
+      const verts = perSetupVerts[sId];
 
-    // 1. Cutting Lines (Cyan)
-    if (cutVerts.length > 0) {
-      const cutGeom = new THREE.BufferGeometry();
-      cutGeom.setAttribute('position', new THREE.Float32BufferAttribute(cutVerts, 3));
-      const cutMat = new THREE.LineBasicMaterial({
-        color: 0x00f0ff,
-        linewidth: 2,
-        transparent: true,
-        opacity: 0.95,
-        depthTest: false,
-      });
-      const lines = new THREE.LineSegments(cutGeom, cutMat);
-      lines.renderOrder = 100;
-      this.toolpathGroup.add(lines);
-    }
+      if (verts.cut.length > 0) {
+        const cutGeom = new THREE.BufferGeometry();
+        cutGeom.setAttribute('position', new THREE.Float32BufferAttribute(verts.cut, 3));
+        const cutMat = new THREE.LineBasicMaterial({
+          color: 0x00f0ff,
+          linewidth: 2,
+          transparent: true,
+          opacity: 0.95,
+          depthTest: false,
+        });
+        const lines = new THREE.LineSegments(cutGeom, cutMat);
+        lines.renderOrder = 100;
+        sGrp.add(lines);
+      }
 
-    // 2. Rapid Lines (Amber / Orange)
-    if (rapidVerts.length > 0) {
-      const rapidGeom = new THREE.BufferGeometry();
-      rapidGeom.setAttribute('position', new THREE.Float32BufferAttribute(rapidVerts, 3));
-      const rapidMat = new THREE.LineBasicMaterial({
-        color: 0xf59e0b,
-        transparent: true,
-        opacity: 0.85,
-        depthTest: false,
-      });
-      const lines = new THREE.LineSegments(rapidGeom, rapidMat);
-      lines.renderOrder = 100;
-      this.toolpathGroup.add(lines);
-    }
+      if (verts.rapid.length > 0) {
+        const rapidGeom = new THREE.BufferGeometry();
+        rapidGeom.setAttribute('position', new THREE.Float32BufferAttribute(verts.rapid, 3));
+        const rapidMat = new THREE.LineBasicMaterial({
+          color: 0xf59e0b,
+          transparent: true,
+          opacity: 0.85,
+          depthTest: false,
+        });
+        const lines = new THREE.LineSegments(rapidGeom, rapidMat);
+        lines.renderOrder = 100;
+        sGrp.add(lines);
+      }
 
-    // 3. Plunge / Ramp Lines (Yellow)
-    if (plungeVerts.length > 0) {
-      const plungeGeom = new THREE.BufferGeometry();
-      plungeGeom.setAttribute('position', new THREE.Float32BufferAttribute(plungeVerts, 3));
-      const plungeMat = new THREE.LineBasicMaterial({
-        color: 0xeab308,
-        linewidth: 2,
-        transparent: true,
-        opacity: 0.95,
-        depthTest: false,
-      });
-      const lines = new THREE.LineSegments(plungeGeom, plungeMat);
-      lines.renderOrder = 100;
-      this.toolpathGroup.add(lines);
-    }
+      if (verts.plunge.length > 0) {
+        const plungeGeom = new THREE.BufferGeometry();
+        plungeGeom.setAttribute('position', new THREE.Float32BufferAttribute(verts.plunge, 3));
+        const plungeMat = new THREE.LineBasicMaterial({
+          color: 0xeab308,
+          linewidth: 2,
+          transparent: true,
+          opacity: 0.95,
+          depthTest: false,
+        });
+        const lines = new THREE.LineSegments(plungeGeom, plungeMat);
+        lines.renderOrder = 100;
+        sGrp.add(lines);
+      }
 
+      this.setupToolpathGroups[sId] = sGrp;
+      this.toolpathGroup.add(sGrp);
+    });
+
+    // In 'all' mode, initial setup is first segment's setup or first setup
+    const initialSetupId = this.animSegments[0]?.setup_id || activeSetupId;
+    this.showSetupToolpaths(activeSetupId === 'all' ? initialSetupId : activeSetupId);
     this.toolpathGroup.visible = (this.toolpathVisible !== undefined ? this.toolpathVisible : true);
 
     // Position tool at start of first segment
@@ -1072,7 +1126,6 @@ class Cam3DViewer {
 
   updateToolPosition() {
     if (!this.animSegments || this.animSegments.length === 0) return;
-    console.log('updateToolPosition: currentAnimDistance=', this.currentAnimDistance.toFixed(2), 'total=', this.totalAnimDistance.toFixed(2));
     let accumulatedDist = 0;
     let accumulatedSec = 0;
 
@@ -1085,6 +1138,18 @@ class Cam3DViewer {
         const pos = new THREE.Vector3().lerpVectors(seg.start, seg.end, alpha);
         this.toolGroup.position.copy(pos);
 
+        // Dynamically switch active setup orientation in Master/All mode
+        if (this.activeSetupId === 'all' && seg.setup_id && seg.setup_id !== this.currentSimSetupId) {
+          this.currentSimSetupId = seg.setup_id;
+          const sObj = seg.setup_obj || this.allSetupsMap?.[seg.setup_id];
+          if (sObj) {
+            const rot = sObj.rotation_deg || [0, 0, 0];
+            const stockBounds = sObj.stock_bounds || null;
+            this.setSetupOrientation(rot, stockBounds, sObj.stock || sObj.stock_cfg || this.clampingConfig);
+          }
+          this.showSetupToolpaths(seg.setup_id);
+        }
+
         // Dynamically update tool model geometry if tool changed
         if (seg.tool_id && seg.tool_id !== this.currentSimToolId && this.toolCatalog[seg.tool_id]) {
           const tInfo = this.toolCatalog[seg.tool_id];
@@ -1093,7 +1158,6 @@ class Cam3DViewer {
         }
 
         // Real-time stock carving update
-        console.log('updateToolPosition: calling carveStockToDistance with', this.currentAnimDistance.toFixed(2), 'segment type:', seg.type, 'tool:', seg.tool_id);
         this.carveStockToDistance(this.currentAnimDistance);
 
         const currentElapsed = accumulatedSec + (alpha * (seg.durationSec || 0));
@@ -1101,10 +1165,13 @@ class Cam3DViewer {
 
         // Check for clamping / fixture breach
         let isClampBreach = false;
-        if (this.stockBounds && this.clampingConfig && this.clampingConfig.clamp_type !== 'none') {
-          const cfg = this.clampingConfig;
+        const sObj = seg.setup_obj || this.allSetupsMap?.[seg.setup_id];
+        const cfg = sObj?.stock || sObj?.stock_cfg || this.clampingConfig;
+        const stkBounds = sObj?.stock_bounds || this.stockBounds;
+
+        if (stkBounds && cfg && cfg.clamp_type !== 'none') {
           const clampH = Math.max(parseFloat(cfg.clamp_height !== undefined ? cfg.clamp_height : (cfg.margin_z_bottom || 3.0)) || 3.0, 0.5);
-          const zClampTop = this.stockBounds.min[2] + clampH;
+          const zClampTop = stkBounds.min[2] + clampH;
           if (pos.z <= zClampTop + 1e-4) {
             isClampBreach = true;
           }
@@ -1115,6 +1182,9 @@ class Cam3DViewer {
           spindle: seg.spindle || 0,
           feed: seg.feed || 0,
           tool: seg.tool_id || '--',
+          setup_id: seg.setup_id || '--',
+          setup_name: sObj?.name || (seg.setup_id === 'setup_002' ? 'Setup 2 (G55)' : 'Setup 1 (G54)'),
+          work_offset: sObj?.work_offset || (seg.setup_id === 'setup_002' ? 'G55' : 'G54'),
           progress: prog,
           elapsedSec: currentElapsed,
           totalSec: this.totalEstSeconds || (this.totalAnimDistance / 1500) * 60,
@@ -1125,18 +1195,7 @@ class Cam3DViewer {
           this.onProgressUpdate(info);
         }
         if (this.onTelemetryUpdate) {
-          this.onTelemetryUpdate({
-            x: pos.x,
-            y: pos.y,
-            z: pos.z,
-            feed: info.feed,
-            spindle: info.spindle,
-            tool_id: info.tool,
-            progress: prog,
-            elapsedSec: currentElapsed,
-            totalSec: info.totalSec,
-            isClampBreach: isClampBreach,
-          });
+          this.onTelemetryUpdate(info);
         }
         break;
       }

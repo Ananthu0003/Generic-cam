@@ -28,7 +28,9 @@ from ..errors import CamError, INVALID_TOOLPATH, UNSUPPORTED_FEATURE
 from ..features import FeatureType, MachiningFeature
 from ..machinability import CuttingParameters
 from ..operations import OpPurpose, PlannedOperation
+from ..algorithms import generate_zigzag_facing, generate_spiral_facing, generate_circular_spiral_facing
 from .semantic import MotionSegment, MotionType, Toolpath
+
 
 
 def _has_self_intersection(polygon: list[np.ndarray]) -> bool:
@@ -425,11 +427,13 @@ class StrategyEngine:
             if hasattr(stock, "kind") and getattr(stock.kind, "value", str(stock.kind)) == "cylinder" and hasattr(stock, "radius") and stock.radius > 0:
                 s_center = stock.center_xy if (hasattr(stock, "center_xy") and stock.center_xy is not None) else np.zeros(2)
                 d_xy = float(np.linalg.norm(p_xy - s_center[:2]))
-                if d_xy <= stock.radius + tool_r + 1e-4:
+                s_margin = tool_r + 2.0
+                if d_xy <= stock.radius + s_margin:
                     top_z = max(top_z, float(stock.bounds_max[2]))
             else:
-                s_min = stock.bounds_min[:2] - (tool_r + 1e-4)
-                s_max = stock.bounds_max[:2] + (tool_r + 1e-4)
+                s_margin = tool_r + 2.0
+                s_min = stock.bounds_min[:2] - s_margin
+                s_max = stock.bounds_max[:2] + s_margin
                 if (s_min[0] <= p_xy[0] <= s_max[0]) and (s_min[1] <= p_xy[1] <= s_max[1]):
                     top_z = max(top_z, float(stock.bounds_max[2]))
 
@@ -471,10 +475,10 @@ class StrategyEngine:
         # Calculate environment material/obstacle top at target XY
         mat_top = self._material_top_at(p_target, tool_r)
         if mat_top > float('-inf'):
-            # Point is above solid material/obstacle: rapid MUST stop above material top
+            # Point is above/near solid material or stock: rapid MUST stop above material top
             approach_z = min(clearance_z, max(mat_top + margin, p_target[2] + margin))
         else:
-            # Free space outside stock/fixtures/model: safe to rapid down to target + margin
+            # Free space completely outside stock/fixtures/model: safe to rapid down to target + margin
             approach_z = min(clearance_z, p_target[2] + margin)
 
         # 1. Retract to clearance if not already there
@@ -600,21 +604,34 @@ class StrategyEngine:
         falls back to edge-parallel intersection math for environments without shapely."""
         try:
             from shapely.geometry import Polygon as _ShapelyPoly
+            from shapely.validation import make_valid
             if len(polygon) < 3:
                 return polygon[:]
-            pts = [(float(p[0]), float(p[1])) for p in polygon]
-            poly = _ShapelyPoly(pts)
+            clean_pts: list[tuple[float, float]] = []
+            for p in polygon:
+                pt = (float(p[0]), float(p[1]))
+                if not clean_pts or (abs(pt[0] - clean_pts[-1][0]) > 1e-5 or abs(pt[1] - clean_pts[-1][1]) > 1e-5):
+                    clean_pts.append(pt)
+            if len(clean_pts) < 3:
+                return polygon[:]
+            poly = _ShapelyPoly(clean_pts)
             if not poly.is_valid:
-                poly = poly.buffer(0)  # repair self-intersections
-            result_geom = poly.buffer(offset, join_style=2, cap_style=3)
+                valid_geom = make_valid(poly)
+                if hasattr(valid_geom, 'geoms'):
+                    poly = max(valid_geom.geoms, key=lambda g: getattr(g, 'area', 0.0))
+                else:
+                    poly = valid_geom
+            result_geom = poly.buffer(offset, join_style=1, cap_style=3)
             if result_geom.is_empty:
                 return []
             # MultiPolygon: take the largest piece
             if hasattr(result_geom, 'geoms'):
-                result_geom = max(result_geom.geoms, key=lambda g: g.area)
+                result_geom = max(result_geom.geoms, key=lambda g: getattr(g, 'area', 0.0))
+            if not hasattr(result_geom, 'exterior') or result_geom.exterior is None:
+                return []
             coords = list(result_geom.exterior.coords)[:-1]  # exclude closing duplicate
             return [np.array([x, y], dtype=float) for x, y in coords]
-        except ImportError:
+        except (ImportError, Exception):
             return self._offset_polygon_fallback(polygon, offset)
 
     @staticmethod
@@ -624,6 +641,8 @@ class StrategyEngine:
         n = len(polygon)
         if n < 3:
             return polygon[:]
+        area = 0.5 * sum(polygon[i][0] * polygon[(i + 1) % n][1] - polygon[(i + 1) % n][0] * polygon[i][1] for i in range(n))
+        sign = 1.0 if area >= 0 else -1.0
         offset_edges = []
         for i in range(n):
             p0 = polygon[i]
@@ -632,12 +651,13 @@ class StrategyEngine:
             edge_len = np.linalg.norm(edge)
             if edge_len < 1e-12:
                 continue
-            normal = np.array([-edge[1], edge[0]], dtype=float) / edge_len
+            normal = sign * np.array([edge[1], -edge[0]], dtype=float) / edge_len
             op0 = p0 + normal * offset
             op1 = p1 + normal * offset
             offset_edges.append((op0, op1))
         if len(offset_edges) < 3:
             return polygon[:]
+
         result = []
         m = len(offset_edges)
         for i in range(m):
@@ -691,6 +711,18 @@ class StrategyEngine:
         hull = lower[:-1] + upper[:-1]
         return [np.array(p, dtype=float) for p in hull]
 
+    @staticmethod
+    def _is_feature_circular(f: MachiningFeature) -> bool:
+        """Check if a feature is geometrically a true cylinder/circular boss/hole."""
+        if bool(f.notes.get("is_circular")):
+            return True
+        if f.diameter is not None and f.diameter > 0 and f.bounds_min is not None and f.bounds_max is not None:
+            dx = float(f.bounds_max[0] - f.bounds_min[0])
+            dy = float(f.bounds_max[1] - f.bounds_min[1])
+            if abs(dx - dy) < 1e-3 and abs(dx - f.diameter) < 1e-3:
+                return True
+        return False
+
     def _feature_boundary_polygon(self, f: MachiningFeature, tool_radius: float = 0.0) -> list[np.ndarray]:
         """Extract a 2D boundary polygon from the feature's wall faces.
         For open features (Step, Shoulder, Open Pocket/Slot), extends open boundaries into open air
@@ -728,8 +760,8 @@ class StrategyEngine:
             return [np.array([p[0], p[1]], dtype=float) for p in f.boundary_loop]
 
         # If feature has circular definition (diameter / axis / center), generate high-resolution circular boundary
-        if f.diameter is not None and f.diameter > 0 and (f.type in (FeatureType.BOSS, FeatureType.CONTOUR) or f.notes.get("is_circular")):
-            r = f.diameter / 2.0
+        if self._is_feature_circular(f):
+            r = f.diameter / 2.0 if (f.diameter is not None and f.diameter > 0) else (f.radius or (f.bounds_max[0] - f.bounds_min[0]) / 2.0)
             cx = (f.bounds_min[0] + f.bounds_max[0]) / 2.0
             cy = (f.bounds_min[1] + f.bounds_max[1]) / 2.0
             n_pts = 64
@@ -800,14 +832,16 @@ class StrategyEngine:
         passes: list[list[np.ndarray]] = []
         # For outer contours / convex bosses: offset outward from part boundary into stock margin
         if not f.is_concave or f.type in (FeatureType.CONTOUR, FeatureType.BOSS):
-            center = np.mean(boundary, axis=0)
-            r_stock_outer = self._stock_outer_radius(center)
-            r_feature = float(np.max(np.linalg.norm(boundary - center, axis=1)))
-            # The innermost tool center outset is inset0 = tool_radius + finish_wall
-            # Outermost tool center outset brings tool outer edge to r_stock_outer:
-            # max_outset = max(inset0, r_stock_outer - r_feature)
-            max_outset = max(inset0, r_stock_outer - r_feature)
-            radial_margin = max(0.0, max_outset - inset0)
+            stock = self.s.setup.stock
+            if stock is not None:
+                s_bmin = stock.bounds_min[:2]
+                s_bmax = stock.bounds_max[:2]
+                margin_x = max(float(s_bmax[0] - bmax[0]), float(bmin[0] - s_bmin[0]), 0.0)
+                margin_y = max(float(s_bmax[1] - bmax[1]), float(bmin[1] - s_bmin[1]), 0.0)
+                radial_margin = max(margin_x, margin_y)
+            else:
+                radial_margin = 0.0
+
             if radial_margin < 1e-4:
                 n_offsets = 1
             else:
@@ -913,6 +947,7 @@ class StrategyEngine:
         n_rows = max(1, int(np.ceil(span[1] / stepover)) + 1)
 
         depth_mode = op.notes.get("depth_mode", "fixed")
+        facing_pattern = op.notes.get("facing_pattern", f.notes.get("facing_pattern", "zigzag"))
         depth_levels = self._compute_depth_levels(
             top_z=top_z,
             target_z=target_z,
@@ -921,27 +956,146 @@ class StrategyEngine:
             mode=depth_mode,
         )
 
+        stock_is_cyl = (
+            hasattr(self.s.setup.stock, "kind")
+            and getattr(self.s.setup.stock.kind, "value", str(self.s.setup.stock.kind)) == "cylinder"
+        )
+        is_circular = (
+            stock_is_cyl
+            or bool(f.notes.get("is_circular"))
+            or self._is_feature_circular(f)
+            or facing_pattern in ("circular", "circular_spiral")
+        )
+
         passes = 0
-        for b, z in enumerate(depth_levels):
-            passes += 1
-            direction = 1 if passes % 2 == 1 else -1
-            for row in range(n_rows):
-                y_index = row if direction == 1 else n_rows - 1 - row
-                y = r_min[1] + min(y_index * stepover, span[1])
-                x0, x1 = (r_min[0], r_max[0]) if row % 2 == 0 else (r_max[0], r_min[0])
-                if row == 0 and b == 0:
-                    self._link_to(tp, op, self._v3(x0, y, z))
-                elif row == 0:
-                    self._link_stay_down(tp, op, self._v3(x0, y, z))
-                else:
-                    self._add_cut(tp, op, self._v3(x0, y, z))
-                self._add_cut(tp, op, self._v3(x1, y, z))
+        if is_circular or facing_pattern in ("circular", "circular_spiral"):
+            c_xy = (
+                self.s.setup.stock.center_xy
+                if (stock_is_cyl and self.s.setup.stock.center_xy is not None)
+                else f.notes.get("center_xy", 0.5 * (region_min + region_max))
+            )
+            r_outer = (
+                self.s.setup.stock.radius
+                if (stock_is_cyl and self.s.setup.stock.radius is not None)
+                else (f.diameter / 2.0 if (f.diameter and f.diameter > 0) else 0.5 * max(span[0], span[1]))
+            )
+            for b, z in enumerate(depth_levels):
+                passes += 1
+                circ_segs = generate_circular_spiral_facing(
+                    center_xy=c_xy,
+                    outer_radius=float(r_outer),
+                    tool_diameter=tool.diameter,
+                    stepover_mm=stepover,
+                    z_depth=z,
+                    climb=True,
+                )
+                for s_idx, seg in enumerate(circ_segs):
+                    if s_idx == 0 and b == 0:
+                        self._link_to(tp, op, seg.start)
+                    elif s_idx == 0:
+                        self._link_stay_down(tp, op, seg.start)
+
+                    if seg.motion_type == "arc_cw":
+                        tp.add(MotionSegment(
+                            motion_type=MotionType.ARC_CW,
+                            start=seg.start,
+                            end=seg.end,
+                            arc_center=seg.arc_center,
+                            arc_ccw=False,
+                            tool_id=tool.id,
+                            operation_id=op.id,
+                            feature_id=f.id,
+                        ))
+                    elif seg.motion_type == "arc_ccw":
+                        tp.add(MotionSegment(
+                            motion_type=MotionType.ARC_CCW,
+                            start=seg.start,
+                            end=seg.end,
+                            arc_center=seg.arc_center,
+                            arc_ccw=True,
+                            tool_id=tool.id,
+                            operation_id=op.id,
+                            feature_id=f.id,
+                        ))
+                    else:
+                        self._add_cut(tp, op, seg.end)
+        elif facing_pattern == "spiral":
+            for b, z in enumerate(depth_levels):
+                passes += 1
+                spiral_segs = generate_spiral_facing(
+                    bounds_min=region_min,
+                    bounds_max=region_max,
+                    tool_diameter=tool.diameter,
+                    stepover_mm=stepover,
+                    z_depth=z,
+                )
+                for s_idx, seg in enumerate(spiral_segs):
+                    if s_idx == 0 and b == 0:
+                        self._link_to(tp, op, seg.start)
+                    elif s_idx == 0:
+                        self._link_stay_down(tp, op, seg.start)
+                    self._add_cut(tp, op, seg.end)
+        elif facing_pattern in ("zigzag_arc", "smooth_zigzag"):
+            for b, z in enumerate(depth_levels):
+                passes += 1
+                zigzag_segs = generate_zigzag_facing(
+                    bounds_min=region_min,
+                    bounds_max=region_max,
+                    tool_diameter=tool.diameter,
+                    stepover_mm=stepover,
+                    z_depth=z,
+                    smooth_arc_links=True,
+                )
+                for s_idx, seg in enumerate(zigzag_segs):
+                    if s_idx == 0 and b == 0:
+                        self._link_to(tp, op, seg.start)
+                    elif s_idx == 0:
+                        self._link_stay_down(tp, op, seg.start)
+
+                    if seg.motion_type == "arc_cw":
+                        tp.add(MotionSegment(
+                            motion_type=MotionType.ARC_CW,
+                            start=seg.start,
+                            end=seg.end,
+                            arc_center=seg.arc_center,
+                            tool_id=tool.id,
+                            operation_id=op.id,
+                            feature_id=f.id,
+                        ))
+                    elif seg.motion_type == "arc_ccw":
+                        tp.add(MotionSegment(
+                            motion_type=MotionType.ARC_CCW,
+                            start=seg.start,
+                            end=seg.end,
+                            arc_center=seg.arc_center,
+                            tool_id=tool.id,
+                            operation_id=op.id,
+                            feature_id=f.id,
+                        ))
+                    else:
+                        self._add_cut(tp, op, seg.end)
+        else:
+            for b, z in enumerate(depth_levels):
+                passes += 1
+                direction = 1 if passes % 2 == 1 else -1
+                for row in range(n_rows):
+                    y_index = row if direction == 1 else n_rows - 1 - row
+                    y = r_min[1] + min(y_index * stepover, span[1])
+                    x0, x1 = (r_min[0], r_max[0]) if row % 2 == 0 else (r_max[0], r_min[0])
+                    if row == 0 and b == 0:
+                        self._link_to(tp, op, self._v3(x0, y, z))
+                    elif row == 0:
+                        self._link_stay_down(tp, op, self._v3(x0, y, z))
+                    else:
+                        self._add_cut(tp, op, self._v3(x0, y, z))
+                    self._add_cut(tp, op, self._v3(x1, y, z))
         # exit and retract
         last = self._seg_end(tp)
         tp.add(MotionSegment(motion_type=MotionType.RETRACT, start=last,
                              end=self._v3(last[0], last[1], self.s.clearance_z),
                              tool_id=tool.id, operation_id=op.id, feature_id=f.id))
         self._end_op(tp, op)
+
 
         total_removal = max(0.0, float(top_z - target_z)) if (top_z is not None and target_z is not None) else float(excess)
         actual_stepdown = float(total_removal / passes) if passes > 0 else float(total_removal)
@@ -1074,7 +1228,7 @@ class StrategyEngine:
         """Boundary-conforming contour-parallel clearing: true polygon offsets
         from the feature boundary, with engagement-aware corner reduction."""
         f = op.feature
-        if (f.type in (FeatureType.BOSS, FeatureType.CONTOUR) and (f.notes.get("is_circular", False) or (f.diameter is not None and f.diameter > 0))):
+        if (f.type in (FeatureType.BOSS, FeatureType.CONTOUR) and self._is_feature_circular(f)):
             return self._boss_circular_roughing(op)
 
         tp = self._toolpath_skeleton(op)
@@ -1356,6 +1510,11 @@ class StrategyEngine:
         tp = self._toolpath_skeleton(op)
         self._start_op(tp, op)
         f = op.feature
+        if not f.is_concave or f.type in (FeatureType.CONTOUR, FeatureType.BOSS, FeatureType.FACING_REGION, FeatureType.PLANAR_WALL):
+            tp.metadata["skipped"] = "rest machining not applicable to external/convex features"
+            tp.segments = []
+            return tp
+
         tool = op.tool
         params = op.params
         radius = tool.diameter / 2.0
@@ -1379,6 +1538,7 @@ class StrategyEngine:
         target_z = f.floor_z + self.s.finish_allowance_floor
         bmin, bmax = f.bounds_min, f.bounds_max
         vs = stock_voxels.voxel_size
+        boundary = self._feature_boundary_polygon(f, tool_radius=0.0)
 
         idx0 = stock_voxels.world_to_index(np.array([bmin[0] + radius, bmin[1] + radius, bmin[2]]))
         idx1 = stock_voxels.world_to_index(np.array([bmax[0] - radius, bmax[1] - radius, bmax[2]]))
@@ -1400,6 +1560,8 @@ class StrategyEngine:
                     continue
                 if h > target_z + 1e-6:
                     w = stock_voxels.index_to_world(np.array([i, j, 0]))
+                    if not self._point_in_polygon(w[:2], boundary):
+                        continue
                     cut_points.append((w[0], w[1], min(h, f.top_z)))
         if not cut_points:
             tp.metadata["skipped"] = "rest machining not needed (no material above target)"
@@ -1486,7 +1648,7 @@ class StrategyEngine:
             return self._finish_radial(op)
         if f.type in (FeatureType.BORE, FeatureType.THROUGH_BORE, FeatureType.BLIND_BORE) or (f.type == FeatureType.POCKET and f.notes.get("is_circular", False)):
             return self._helical_interpolation(op)
-        if (f.type in (FeatureType.BOSS, FeatureType.CONTOUR) and (f.notes.get("is_circular", False) or (f.diameter is not None and f.diameter > 0))):
+        if (f.type in (FeatureType.BOSS, FeatureType.CONTOUR) and self._is_feature_circular(f)):
             return self._boss_circular_contour(op)
         if f.type is FeatureType.FILLET:
             if self.s.mesh is not None and hasattr(self.s.mesh, "triangles") and len(self.s.mesh.triangles) > 0 and op.tool.type is ToolType.BALL_ENDMILL:
@@ -1866,19 +2028,32 @@ class StrategyEngine:
             }
         tp.metadata["depth_levels"] = depth_levels
 
+        # Dogbone corner relief for internal concave pockets/slots
+        if op.notes.get("dogbone") and not is_outer and len(corners) >= 3:
+            from ..algorithms.dressups import generate_dogbone_corners
+            corners = [np.array([p[0], p[1]], dtype=float) for p in generate_dogbone_corners(corners, radius)]
+
         is_closed_loop = len(corners) >= 3
+
+        # Compute 2D centroid for robust outward/inward approach vectors
+        if len(corners) >= 3:
+            c_arr = np.array([c[:2] for c in corners])
+            centroid_2d = c_arr.mean(axis=0)
+        else:
+            centroid_2d = 0.5 * (bmin + bmax)
 
         for b, z_band in enumerate(depth_levels):
             band_corners = [self._v3(c[0], c[1], z_band) for c in corners]
             c0 = band_corners[0]
-            # Approach point for linear G41 engagement:
-            # For outer contours: must be in open air outside the model, not inside the edge!
-            if is_outer:
-                approach_pt = self._v3(c0[0] - comp_vec, c0[1], z_band)
-                departure_pt = self._v3(c0[0], c0[1] - comp_vec, z_band)
-            else:
-                approach_pt = self._v3(c0[0] + comp_vec, c0[1] + comp_vec, z_band)
-                departure_pt = self._v3(c0[0] + comp_vec, c0[1] + comp_vec, z_band)
+            
+            # Outward normal vector from centroid to ensure lead-in/out is in open air
+            v_out = c0[:2] - centroid_2d
+            norm_v = np.linalg.norm(v_out)
+            dir_normal = (v_out / norm_v) if norm_v > 1e-6 else np.array([1.0, 0.0])
+            lead_vec = (dir_normal * comp_vec) if is_outer else (-dir_normal * comp_vec)
+
+            approach_pt = self._v3(c0[0] + lead_vec[0], c0[1] + lead_vec[1], z_band)
+            departure_pt = self._v3(c0[0] + lead_vec[0], c0[1] + lead_vec[1], z_band)
 
             self._link_to(tp, op, approach_pt)
 
@@ -1904,10 +2079,25 @@ class StrategyEngine:
                 metadata=entry_meta,
             ))
 
-            # Cut around closed contour or linear path
+            # Cut around closed contour or linear path with optional elevated holding tabs on final depth level
             cut_targets = (band_corners[1:] + [band_corners[0]]) if is_closed_loop else band_corners[1:]
-            for c in cut_targets:
-                self._add_cut(tp, op, c)
+            if b == len(depth_levels) - 1 and op.notes.get("holding_tabs") and is_closed_loop and is_outer:
+                from ..algorithms.dressups import generate_holding_tabs
+                tab_count = int(op.notes.get("tab_count", 4))
+                tab_w = float(op.notes.get("tab_width", max(tool.diameter * 1.5, 4.0)))
+                tab_h = float(op.notes.get("tab_height", 2.0))
+                tabbed_pts = generate_holding_tabs(
+                    contour_points=[c0] + cut_targets,
+                    tab_count=tab_count,
+                    tab_width=tab_w,
+                    tab_height=tab_h,
+                    floor_z=z_band,
+                )
+                for pt in tabbed_pts[1:]:
+                    self._add_cut(tp, op, pt)
+            else:
+                for c in cut_targets:
+                    self._add_cut(tp, op, c)
 
             # Linear departure move cancelling cutter compensation (G40 only if active)
             prev = self._seg_end(tp)
@@ -1927,29 +2117,19 @@ class StrategyEngine:
             ))
 
 
-        # floor finishing: serpentine at floor level (skip for outer contours and planar walls)
-        if f.type not in (FeatureType.CONTOUR, FeatureType.PLANAR_WALL):
+        # floor finishing: boundary-conforming contour-parallel passes at floor level
+        if f.type not in (FeatureType.CONTOUR, FeatureType.PLANAR_WALL, FeatureType.BOSS):
             stepover = max(params.stepover_mm, 1e-3)
-            model_bmin = self.s.setup.stock.bounds_min[:2]
-            model_bmax = self.s.setup.stock.bounds_max[:2]
-            if hasattr(self.s, "mesh") and self.s.mesh is not None and hasattr(self.s.mesh, "bounds_min"):
-                model_bmin = self.s.mesh.bounds_min[:2]
-                model_bmax = self.s.mesh.bounds_max[:2]
-
-            # For closed walls, inset by radius; for open edges, extend past the boundary by radius to clear corners
-            x0 = (bmin[0] - radius) if (is_open_feat and abs(bmin[0] - model_bmin[0]) < 1.0) else (bmin[0] + radius)
-            x1 = (bmax[0] + radius) if (is_open_feat and abs(bmax[0] - model_bmax[0]) < 1.0) else (bmax[0] - radius)
-            y0 = (bmin[1] - radius) if (is_open_feat and abs(bmin[1] - model_bmin[1]) < 1.0) else (bmin[1] + radius)
-            y1 = (bmax[1] + radius) if (is_open_feat and abs(bmax[1] - model_bmax[1]) < 1.0) else (bmax[1] - radius)
-
-            if x1 >= x0 and y1 >= y0:
-                n_rows = max(1, int(np.ceil((y1 - y0) / stepover)) + 1)
-                for r in range(n_rows):
-                    y = y0 + min(r * stepover, y1 - y0)
-                    xa, xb = (x0, x1) if r % 2 == 0 else (x1, x0)
-                    row_start = self._v3(xa, y, floor_z)
-                    self._link_to(tp, op, row_start)
-                    self._add_cut(tp, op, self._v3(xb, y, floor_z))
+            floor_passes = self._contour_parallel_passes(
+                f, radius, finish_wall=0.0, stepover=stepover, z=floor_z)
+            for pts in floor_passes:
+                if not pts:
+                    continue
+                self._link_to(tp, op, pts[0])
+                for pt in pts[1:]:
+                    self._add_cut(tp, op, pt)
+                if len(pts) > 2:
+                    self._add_cut(tp, op, pts[0])
 
         last = self._seg_end(tp)
         tp.add(MotionSegment(motion_type=MotionType.RETRACT, start=last,
