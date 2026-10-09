@@ -1086,9 +1086,21 @@ class Setup:
         return self.stock_top_z + self.approach_margin
 
     @property
-    def retract_z(self) -> float:
-        """Setup-relative default retract plane (stock top + retract margin)."""
-        return self.stock_top_z + self.retract_margin
+    def safe_machining_z_min(self) -> float:
+        """Lowest safe Z level for cutting motions in setup space, staying safely above fixtures/clamps."""
+        z_min = float('-inf')
+        if self.fixtures:
+            for f in self.fixtures:
+                bmax = getattr(f, "bounds_max", None)
+                if bmax is not None:
+                    z_min = max(z_min, float(bmax[2]))
+                elif hasattr(f, "triangles") and len(f.triangles):
+                    z_min = max(z_min, float(f.triangles[:, :, 2].max()))
+        if self.stock is not None and getattr(self.stock, "bounds_min", None) is not None:
+            clamp_h = getattr(self.stock, "clamp_height", 0.0) or 0.0
+            if clamp_h > 0:
+                z_min = max(z_min, float(self.stock.bounds_min[2]) + float(clamp_h))
+        return z_min
 
     def transform_point(self, pt: np.ndarray) -> np.ndarray:
         """Transform point(s) from Canonical CAD coordinates into Setup coordinates."""

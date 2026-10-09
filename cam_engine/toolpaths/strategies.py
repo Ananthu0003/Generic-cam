@@ -1155,9 +1155,11 @@ class StrategyEngine:
 
         doc = max(params.depth_of_cut_mm, 1e-3)
         depth_mode = op.notes.get("depth_mode", "fixed")
+        top_z = op.start_z if (hasattr(op, "start_z") and op.start_z is not None) else f.top_z
+        floor_z = op.final_z if (hasattr(op, "final_z") and op.final_z is not None) else f.floor_z
         depth_levels = self._compute_finishing_depth_levels(
-            top_z=f.top_z,
-            floor_z=f.floor_z,
+            top_z=top_z,
+            floor_z=floor_z,
             max_stepdown=doc,
             remaining_allowance=self.s.finish_allowance_floor,
             mode=depth_mode,
@@ -1237,8 +1239,8 @@ class StrategyEngine:
         params = op.params
         radius = tool.diameter / 2.0
 
-        floor_z = f.floor_z + self.s.finish_allowance_floor
-        top_z = f.top_z
+        top_z = op.start_z if (hasattr(op, "start_z") and op.start_z is not None) else f.top_z
+        target_floor_z = op.final_z if (hasattr(op, "final_z") and op.final_z is not None) else f.floor_z
         stepdown = params.depth_of_cut_mm
         stepover = params.stepover_mm
         finish_wall = self.s.finish_allowance_wall
@@ -1246,7 +1248,7 @@ class StrategyEngine:
         depth_mode = op.notes.get("depth_mode", "fixed")
         depth_levels = self._compute_depth_levels(
             top_z=top_z,
-            target_z=f.floor_z,
+            target_z=target_floor_z,
             max_stepdown=stepdown,
             remaining_allowance=self.s.finish_allowance_floor,
             mode=depth_mode,
@@ -1353,8 +1355,9 @@ class StrategyEngine:
         params = op.params
         radius = tool.diameter / 2.0
 
-        floor_z = f.floor_z + self.s.finish_allowance_floor
-        top_z = f.top_z
+        top_z = op.start_z if (hasattr(op, "start_z") and op.start_z is not None) else f.top_z
+        target_floor_z = op.final_z if (hasattr(op, "final_z") and op.final_z is not None) else f.floor_z
+        floor_z = target_floor_z + self.s.finish_allowance_floor
         stepdown = params.depth_of_cut_mm
         finish_wall = self.s.finish_allowance_wall
 
@@ -1362,10 +1365,10 @@ class StrategyEngine:
         is_slot = min(extent) < 1.5 * tool.diameter
 
         if is_slot:
-            self._trochoidal_slot(tp, op, f, tool, params, top_z, floor_z,
+            self._trochoidal_slot(tp, op, f, tool, params, top_z, target_floor_z,
                                   stepdown, finish_wall)
         else:
-            self._hecm_pocket(tp, op, f, tool, params, top_z, floor_z,
+            self._hecm_pocket(tp, op, f, tool, params, top_z, target_floor_z,
                               stepdown, finish_wall)
 
         last = self._seg_end(tp)
@@ -1401,7 +1404,7 @@ class StrategyEngine:
         depth_mode = op.notes.get("depth_mode", "fixed")
         depth_levels = self._compute_depth_levels(
             top_z=top_z,
-            target_z=f.floor_z,
+            target_z=floor_z,
             max_stepdown=stepdown,
             remaining_allowance=self.s.finish_allowance_floor,
             mode=depth_mode,
@@ -1458,7 +1461,7 @@ class StrategyEngine:
         depth_mode = op.notes.get("depth_mode", "fixed")
         depth_levels = self._compute_depth_levels(
             top_z=top_z,
-            target_z=f.floor_z,
+            target_z=floor_z,
             max_stepdown=stepdown,
             remaining_allowance=self.s.finish_allowance_floor,
             mode=depth_mode,
@@ -1683,6 +1686,10 @@ class StrategyEngine:
           final finishing pass exactly on target (target_z + remaining_allowance)
         """
         target_floor = float(target_z + remaining_allowance)
+        safe_z = getattr(self.s.setup, "safe_machining_z_min", float('-inf')) if (hasattr(self, "s") and hasattr(self.s, "setup") and self.s.setup is not None) else float('-inf')
+        if safe_z > float('-inf') and target_floor < safe_z:
+            target_floor = safe_z + remaining_allowance
+
         total_depth = float(top_z - target_floor)
 
         if total_depth <= 1e-6:
@@ -1737,8 +1744,8 @@ class StrategyEngine:
         r_boss = (f.diameter / 2.0) if (f.diameter is not None and f.diameter > 0) else (f.radius if (f.radius is not None and f.radius > 0) else (f.bounds_max[0] - f.bounds_min[0]) / 2.0)
         r_tool = tool.diameter / 2.0
         r_path = r_boss + r_tool
-        top_z = f.top_z
-        floor_z = f.floor_z
+        top_z = op.start_z if (hasattr(op, "start_z") and op.start_z is not None) else f.top_z
+        floor_z = op.final_z if (hasattr(op, "final_z") and op.final_z is not None) else f.floor_z
         doc = max(params.depth_of_cut_mm, 1e-3)
         depth_mode = op.notes.get("depth_mode", "fixed")
         depth_levels = self._compute_finishing_depth_levels(
@@ -1976,8 +1983,8 @@ class StrategyEngine:
         # wall finishing: full depth contour with cutter compensation (G41 only if requested)
         from .semantic import ToolpathRepresentation, CompensationMode
 
-        floor_z = f.floor_z
-        top_z = f.top_z
+        floor_z = op.final_z if (hasattr(op, "final_z") and op.final_z is not None) else f.floor_z
+        top_z = op.start_z if (hasattr(op, "start_z") and op.start_z is not None) else f.top_z
         doc = max(params.depth_of_cut_mm, 1e-3)
         depth_mode = op.notes.get("depth_mode", "fixed")
         depth_levels = self._compute_finishing_depth_levels(

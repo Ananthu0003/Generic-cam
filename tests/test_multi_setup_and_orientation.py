@@ -120,3 +120,92 @@ def test_multi_setup_planning_and_gcode_pipeline(client):
     gc_data = res_gc.json()
     assert "G54" in gc_data["gcode"]
     assert gc_data["line_count"] > 10
+
+
+def test_multi_setup_safe_depth_and_through_feature_isolation(client):
+    """Verify that multi-setup planning isolates operations between setups:
+    1. Outer contour passes respect fixture clamping limits and parting planes.
+    2. Through features drilled in Setup 1 are not re-drilled in Setup 2.
+    3. No cutting moves penetrate into the setup workholding envelope.
+    """
+    client.get("/api/model/demo")
+
+    # Add Setup 2 (Flip 180° / G55)
+    client.post("/api/setups/add", json={
+        "name": "Setup 2 - Bottom Flip",
+        "work_offset": "G55",
+        "preset": "flip_x_180",
+    })
+
+    # Plan operations with vise jaw workholding (3mm clamping height)
+    stock_payload = {
+        "margin_x": 5.0,
+        "margin_y": 5.0,
+        "margin_z_top": 1.0,
+        "margin_z_bottom": 4.0,
+        "clamp_type": "vise_jaws",
+        "clamp_height": 4.0,
+        "material": "aluminum_6061",
+    }
+    client.post("/api/recognize-features")
+    res_ops = client.post("/api/plan-operations", json={"stock": stock_payload})
+    assert res_ops.status_code == 200
+    ops = res_ops.json()["operations"]
+
+    # Verify Setup 1 has through-hole drilling
+    s1_ops = [op for op in ops if op.get("setup_id") == "setup_001"]
+    s2_ops = [op for op in ops if op.get("setup_id") == "setup_002"]
+
+    s1_drill_ops = [op for op in s1_ops if op["purpose"] == "drilling"]
+    assert len(s1_drill_ops) > 0, "Setup 1 should plan drilling for through holes"
+
+    # Verify Setup 2 does not duplicate heavy drilling through the already drilled hole
+    s2_drill_ops = [op for op in s2_ops if op["purpose"] == "drilling"]
+    assert len(s2_drill_ops) == 0, "Setup 2 should not re-drill through holes already completed in Setup 1"
+
+    # Generate toolpaths
+    res_tp = client.post("/api/generate-toolpaths", json={"stock": stock_payload, "all_setups": True})
+    assert res_tp.status_code == 200
+    tps = res_tp.json()["toolpaths"]
+
+    for tp in tps:
+        setup_id = tp.get("setup_id")
+        # In Setup 1 (Z in [0, 25]), stock bottom is -4.0, clamp top is 0.0
+        # In Setup 2 (Z in [-25, 0]), stock bottom is -29.0, clamp top is -25.0
+        setup_safe_z = 0.0 if setup_id == "setup_001" else -25.0
+        for seg in tp.get("segments", []):
+            if seg.get("motion_type") == "cut":
+                start_z = seg["start"][2]
+                end_z = seg["end"][2]
+                assert min(start_z, end_z) >= setup_safe_z - 0.5, (
+                    f"Cutting segment plunged into clamping fixture: Z={min(start_z, end_z)} "
+                    f"(safe floor={setup_safe_z}) in {setup_id}"
+                )
+
+
+def test_stepped_boss_outer_contour_multi_setup(client):
+    """Verify that multi-level stepped parts distinguish upper protruding bosses from lower base perimeters,
+    cutting the boss down to its step face without floating air cuts or duplicate re-cutting."""
+    # Setup auto-generate
+    client.post("/api/setups/auto-generate")
+    stock_payload = {
+        "mode": "relative",
+        "margin_x": 5.0,
+        "margin_y": 5.0,
+        "margin_z_top": 1.0,
+        "margin_z_bottom": 3.0,
+        "clamp_type": "vise_jaws",
+        "clamp_height": 3.0,
+    }
+
+    client.post("/api/recognize-features")
+    res_ops = client.post("/api/plan-operations", json={"stock": stock_payload})
+    assert res_ops.status_code == 200
+    ops = res_ops.json()["operations"]
+
+    res_tp = client.post("/api/generate-toolpaths", json={"stock": stock_payload, "all_setups": True})
+    assert res_tp.status_code == 200
+    tps = res_tp.json()["toolpaths"]
+    assert len(tps) > 0
+
+

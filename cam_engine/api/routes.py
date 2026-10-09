@@ -1157,6 +1157,12 @@ def plan_operations(request: Request, req: PlanOpsRequest):
 
     try:
         ctx, setups = _build_context_and_setups(sess, req.stock)
+        ctx.all_features = sess.features
+        for s in setups:
+            s.features = [
+                f for f in sess.features
+                if f.notes.get("setup_id", sess.setups[0].id) == s.id
+            ]
         all_ops: list[PlannedOperation] = []
 
         all_warnings: list[dict] = []
@@ -1164,9 +1170,8 @@ def plan_operations(request: Request, req: PlanOpsRequest):
 
         for s in setups:
             setup_features = [
-                f for f in sess.features
-                if f.notes.get("setup_id", sess.setups[0].id) == s.id
-                and (not req.selected_features or f.id in req.selected_features)
+                f for f in s.features
+                if (not req.selected_features or f.id in req.selected_features)
             ]
             if setup_features:
                 planner = OperationPlanner(ctx, s, setup_features)

@@ -1117,6 +1117,8 @@ class FeatureRecognizer:
             if self._tags.get(f.index) != "slanted" or f.surface.kind is not SurfaceKind.PLANE:
                 continue
             n = f.oriented_normal
+            if float(n @ self.tool_axis) <= 0.05:
+                continue
             angle_from_horiz = abs(float(np.degrees(np.arcsin(np.clip(n[2], -1, 1)))))
             if 15.0 < angle_from_horiz < 75.0:
                 zs = f.triangles[:, :, 2]
@@ -1353,22 +1355,8 @@ class FeatureRecognizer:
 
         wall_faces = [f.index for f in self.faces if self._tags.get(f.index) in ("wall", "slanted", "cylinder")]
 
-        boundary_loop: Optional[list[np.ndarray]] = None
-        # Look for the outer wire of a face that matches the overall bounding box extent
-        for f in self.faces:
-            if self._tags.get(f.index) in ("top", "bottom", "step_floor"):
-                f_extent = f.bounds_max[:2] - f.bounds_min[:2]
-                if abs(f_extent[0] - extent[0]) < 0.5 and abs(f_extent[1] - extent[1]) < 0.5:
-                    for w in f.wires:
-                        if w.is_outer and len(w.points) >= 3:
-                            boundary_loop = [p[:2].copy() for p in w.points]
-                            break
-            if boundary_loop is not None:
-                break
-
-        if boundary_loop is None:
-            # Monotone chain 2D convex hull
-            pts_2d = sorted({(round(float(p[0]), 3), round(float(p[1]), 3)) for p in all_pts})
+        def _compute_hull(pts: np.ndarray) -> list[np.ndarray]:
+            pts_2d = sorted({(round(float(p[0]), 3), round(float(p[1]), 3)) for p in pts})
             if len(pts_2d) >= 3:
                 lower: list[tuple[float, float]] = []
                 for p in pts_2d:
@@ -1381,15 +1369,156 @@ class FeatureRecognizer:
                         upper.pop()
                     upper.append(p)
                 hull = lower[:-1] + upper[:-1]
-                boundary_loop = [np.array([p[0], p[1]], dtype=float) for p in hull]
+                return [np.array([p[0], p[1]], dtype=float) for p in hull]
+            pts_min = pts.min(axis=0)
+            pts_max = pts.max(axis=0)
+            return [
+                np.array([pts_min[0], pts_min[1]]),
+                np.array([pts_max[0], pts_min[1]]),
+                np.array([pts_max[0], pts_max[1]]),
+                np.array([pts_min[0], pts_max[1]]),
+            ]
+
+        # Check if the part has continuous full-height outer wall faces spanning from bottom to top.
+        # If full-height outer walls exist (e.g. prismatic brackets with steps/pockets), the outer contour
+        # is the full-height perimeter of the part, NOT a stepped boss.
+        has_full_height_outer_walls = any(
+            self.faces[i].bounds_min[2] <= model_bottom_z + 0.5
+            and self.faces[i].bounds_max[2] >= self._model_top_z - 0.5
+            for i in wall_faces
+        )
+
+        stepped_features_created = False
+        if not has_full_height_outer_walls:
+            step_floors = []
+            for f in self.faces:
+                if self._tags.get(f.index) == "floor" and f.area > 2.0:
+                    zs = f.triangles[:, :, 2]
+                    z_fl = float(zs.mean())
+                    if model_bottom_z + 0.5 < z_fl < self._model_top_z - 0.5:
+                        f_ext = f.bounds_max[:2] - f.bounds_min[:2]
+                        # Flange floor must extend to the outer extent of the base
+                        if abs(f_ext[0] - extent[0]) < 1.0 or abs(f_ext[1] - extent[1]) < 1.0:
+                            step_floors.append((z_fl, f))
+
+            if step_floors:
+                step_floors.sort(key=lambda x: x[0])
+                for z_fl, fl_face in step_floors:
+                    u_wall_faces = [
+                        f.index for f in self.faces
+                        if self._tags.get(f.index) in ("wall", "slanted", "cylinder")
+                        and f.bounds_min[2] >= z_fl - 0.15
+                        and f.bounds_max[2] > z_fl + 0.3
+                    ]
+                    if not u_wall_faces:
+                        continue
+                    u_pts_list = [self.faces[i].triangles.reshape(-1, 3) for i in u_wall_faces if len(self.faces[i].triangles)]
+                    if not u_pts_list:
+                        continue
+                    u_pts = np.concatenate(u_pts_list)
+                    u_bmin = u_pts.min(axis=0)
+                    u_bmax = u_pts.max(axis=0)
+                    u_extent = u_bmax[:2] - u_bmin[:2]
+
+                    if (u_extent[0] < extent[0] - 0.5 or u_extent[1] < extent[1] - 0.5) and (u_extent[0] > 0.5 and u_extent[1] > 0.5):
+                        u_loop = _compute_hull(u_pts)
+                        u_depth = self._model_top_z - z_fl
+                        u_center = np.array([0.5 * (u_bmin[0] + u_bmax[0]), 0.5 * (u_bmin[1] + u_bmax[1]), 0.5 * (self._model_top_z + z_fl)])
+
+                        out.append(MachiningFeature(
+                            id=f"contour_boss_{fl_face.index}",
+                            type=FeatureType.CONTOUR,
+                            face_indices=u_wall_faces,
+                            bounds_min=np.array([u_bmin[0], u_bmin[1], z_fl]),
+                            bounds_max=np.array([u_bmax[0], u_bmax[1], self._model_top_z]),
+                            depth=u_depth,
+                            top_z=self._model_top_z,
+                            floor_z=z_fl,
+                            axis=self.tool_axis.copy(),
+                            is_concave=False,
+                            accessibility=Accessibility.TOOL_AXIS_OK,
+                            wall_faces=u_wall_faces,
+                            boundary_loop=u_loop,
+                            source_edges=self._edges_for_faces(u_wall_faces),
+                            tolerances=self._tolerance_for_faces(u_wall_faces),
+                            notes={"perimeter": True, "outer_contour": True, "step_boss": True, "floor_face": fl_face.index},
+                            recognition_evidence=[
+                                "stepped_boss_outer_contour",
+                                f"depth_{u_depth:.2f}",
+                                f"floor_z_{z_fl:.2f}",
+                            ],
+                            surface_type="contour",
+                            center=u_center,
+                            axial_start=self._model_top_z,
+                            axial_end=z_fl,
+                            orientation=self.tool_axis.copy(),
+                            source_geometry_reference=f"Face#{fl_face.index}:STEP_BOSS_CONTOUR",
+                        ))
+
+                        l_wall_faces = [
+                            f.index for f in self.faces
+                            if self._tags.get(f.index) in ("wall", "slanted", "cylinder")
+                            and f.bounds_max[2] <= z_fl + 0.15
+                            and f.bounds_min[2] < z_fl - 0.2
+                        ]
+                        if l_wall_faces:
+                            l_pts_list = [self.faces[i].triangles.reshape(-1, 3) for i in l_wall_faces if len(self.faces[i].triangles)]
+                            if l_pts_list:
+                                l_pts = np.concatenate(l_pts_list)
+                                l_bmin = l_pts.min(axis=0)
+                                l_bmax = l_pts.max(axis=0)
+                                l_loop = _compute_hull(l_pts)
+                                l_depth = z_fl - model_bottom_z
+                                l_center = np.array([0.5 * (l_bmin[0] + l_bmax[0]), 0.5 * (l_bmin[1] + l_bmax[1]), 0.5 * (z_fl + model_bottom_z)])
+
+                                out.append(MachiningFeature(
+                                    id="contour_outer",
+                                    type=FeatureType.CONTOUR,
+                                    face_indices=l_wall_faces,
+                                    bounds_min=np.array([l_bmin[0], l_bmin[1], model_bottom_z]),
+                                    bounds_max=np.array([l_bmax[0], l_bmax[1], z_fl]),
+                                    depth=l_depth,
+                                    top_z=z_fl,
+                                    floor_z=model_bottom_z,
+                                    axis=self.tool_axis.copy(),
+                                    is_concave=False,
+                                    accessibility=Accessibility.TOOL_AXIS_OK,
+                                    wall_faces=l_wall_faces,
+                                    boundary_loop=l_loop,
+                                    source_edges=self._edges_for_faces(l_wall_faces),
+                                    tolerances=self._tolerance_for_faces(l_wall_faces),
+                                    notes={"perimeter": True, "outer_contour": True, "base_contour": True},
+                                    recognition_evidence=[
+                                        "base_outer_contour",
+                                        f"depth_{l_depth:.2f}",
+                                    ],
+                                    surface_type="contour",
+                                    center=l_center,
+                                    axial_start=z_fl,
+                                    axial_end=model_bottom_z,
+                                    orientation=self.tool_axis.copy(),
+                                    source_geometry_reference="MODEL:BASE_PERIMETER_CONTOUR",
+                                ))
+                                stepped_features_created = True
+                                break
+
+        if stepped_features_created:
+            return out
+
+        boundary_loop: Optional[list[np.ndarray]] = None
+        for f in self.faces:
+            if self._tags.get(f.index) in ("top", "bottom", "step_floor"):
+                f_extent = f.bounds_max[:2] - f.bounds_min[:2]
+                if abs(f_extent[0] - extent[0]) < 0.5 and abs(f_extent[1] - extent[1]) < 0.5:
+                    for w in f.wires:
+                        if w.is_outer and len(w.points) >= 3:
+                            boundary_loop = [p[:2].copy() for p in w.points]
+                            break
+            if boundary_loop is not None:
+                break
 
         if boundary_loop is None:
-            boundary_loop = [
-                np.array([bmin[0], bmin[1]]),
-                np.array([bmax[0], bmin[1]]),
-                np.array([bmax[0], bmax[1]]),
-                np.array([bmin[0], bmax[1]]),
-            ]
+            boundary_loop = _compute_hull(all_pts)
 
 
         contour_center = np.array([0.5 * (bmin[0] + bmax[0]), 0.5 * (bmin[1] + bmax[1]), 0.5 * (self._model_top_z + model_bottom_z)])

@@ -246,7 +246,7 @@ class OperationValidityChecker:
             self._check_tool_access(feature),
             self._check_depth(feature),
             self._check_stock_intersection(tool, toolpath),
-            self._check_reaches_target(feature, toolpath, purpose),
+            self._check_reaches_target(feature, toolpath, purpose, op=op),
             self._check_compensation(tool, toolpath),
             self._check_feed(toolpath),
             self._check_rpm(toolpath),
@@ -448,7 +448,7 @@ class OperationValidityChecker:
 
     # -- 7. toolpath reaches target ----------------------------------------
     def _check_reaches_target(self, feature: Any, toolpath: Any,
-                              purpose: str) -> ValidityCheck:
+                              purpose: str, op: Any = None) -> ValidityCheck:
         if toolpath is None:
             return self._skip(TOOLPATH_REACHES_TARGET, "no toolpath generated yet")
         if feature is None:
@@ -469,7 +469,9 @@ class OperationValidityChecker:
                                   f"segment space {seg.space} is not setup space")
             zs.extend([float(np.asarray(seg.start, dtype=float)[2]),
                        float(np.asarray(seg.end, dtype=float)[2])])
-        floor_z = getattr(feature, "floor_z", None)
+        floor_z = getattr(op, "final_z", None) if op is not None else None
+        if floor_z is None:
+            floor_z = getattr(feature, "floor_z", None)
         if floor_z is None:
             return self._skip(TOOLPATH_REACHES_TARGET, "feature has no floor surface")
         deepest = min(zs)

@@ -570,10 +570,149 @@ class OperationPlanner:
             return None
         return res.selected_tool
 
+    def _is_machined_in_prior_setup(self, feature: MachiningFeature) -> bool:
+        """Check if this through-feature or base contour was already planned/machined in a prior opposing setup."""
+        if not hasattr(self.context, "setups") or len(self.context.setups) <= 1:
+            return False
+
+        curr_idx = next((i for i, s in enumerate(self.context.setups) if s.id == self.setup.id), -1)
+        if curr_idx <= 0:
+            return False  # Primary setup machines it first
+
+        M_curr = self.setup.model_to_setup
+        try:
+            M_curr_inv = np.linalg.inv(M_curr)
+        except np.linalg.LinAlgError:
+            M_curr_inv = np.eye(4)
+        u_curr = (M_curr_inv @ np.array([0.0, 0.0, 1.0, 0.0]))[:3]
+
+        # Case 1: Base outer contour that was already machined from the primary setup
+        is_base_contour = bool(feature.notes.get("base_contour"))
+        if is_base_contour:
+            for prior_idx in range(curr_idx):
+                prior_s = self.context.setups[prior_idx]
+                M_prior = prior_s.model_to_setup
+                try:
+                    M_prior_inv = np.linalg.inv(M_prior)
+                except np.linalg.LinAlgError:
+                    M_prior_inv = np.eye(4)
+                u_prior = (M_prior_inv @ np.array([0.0, 0.0, 1.0, 0.0]))[:3]
+                if float(np.dot(u_curr, u_prior)) <= -0.85:
+                    return True
+
+        # Case 2: Coaxial Holes / Bores / Through features
+        is_hole_or_bore = (
+            feature.type in (
+                FeatureType.HOLE, FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE,
+                FeatureType.BORE, FeatureType.THROUGH_BORE, FeatureType.BLIND_BORE,
+            )
+            or bool(feature.notes.get("is_through"))
+        )
+        if not is_hole_or_bore:
+            return False
+
+        c_setup = np.array([feature.center_xy[0], feature.center_xy[1], feature.top_z if feature.top_z is not None else 0.0, 1.0])
+        c_model = (M_curr_inv @ c_setup)[:3]
+        r1 = float(feature.diameter / 2.0 if feature.diameter else (min(feature.xy_extent) / 2.0 if len(feature.xy_extent) else 1.0))
+
+        for prior_idx in range(curr_idx):
+            prior_s = self.context.setups[prior_idx]
+            M_prior = prior_s.model_to_setup
+            try:
+                M_prior_inv = np.linalg.inv(M_prior)
+            except np.linalg.LinAlgError:
+                M_prior_inv = np.eye(4)
+            u_prior = (M_prior_inv @ np.array([0.0, 0.0, 1.0, 0.0]))[:3]
+
+            dot = float(np.dot(u_curr, u_prior))
+            if dot <= -0.85:
+                prior_feats = getattr(prior_s, "features", []) or []
+                if hasattr(self.context, "all_features") and self.context.all_features:
+                    prior_feats = [f for f in self.context.all_features if f.notes.get("setup_id") == prior_s.id]
+                for f2 in prior_feats:
+                    is_f2_cyl = (
+                        f2.type in (
+                            FeatureType.HOLE, FeatureType.THROUGH_HOLE, FeatureType.BLIND_HOLE,
+                            FeatureType.BORE, FeatureType.THROUGH_BORE, FeatureType.BLIND_BORE,
+                        )
+                        or bool(f2.notes.get("is_through"))
+                    )
+                    if not is_f2_cyl:
+                        continue
+                    p2_setup = np.array([f2.center_xy[0], f2.center_xy[1], f2.top_z if f2.top_z is not None else 0.0, 1.0])
+                    p2_model = (M_prior_inv @ p2_setup)[:3]
+                    delta = c_model - p2_model
+                    axial_dist = float(np.dot(delta, u_curr))
+                    radial_dist = float(np.linalg.norm(delta - axial_dist * u_curr))
+                    if radial_dist <= max(r1, 0.5):
+                        return True
+        return False
+
+    def _get_effective_z_floor(self, feature: MachiningFeature) -> float:
+        """Calculate effective safe cut floor for a feature, respecting fixtures and multi-setup partitioning."""
+        safe_fixture_z = getattr(self.setup, "safe_machining_z_min", float('-inf'))
+        floor_z = float(feature.floor_z) if feature.floor_z is not None else 0.0
+        top_z = float(feature.top_z) if feature.top_z is not None else floor_z + 10.0
+
+        is_outer = (
+            feature.type in (FeatureType.CONTOUR, FeatureType.BOSS)
+            or bool(feature.notes.get("outer_contour"))
+            or bool(feature.notes.get("perimeter"))
+        )
+
+        if not is_outer:
+            if safe_fixture_z > float('-inf') and floor_z < safe_fixture_z:
+                return safe_fixture_z + 0.2
+            return floor_z
+
+        if bool(feature.notes.get("step_boss")):
+            # Step boss terminates at its explicit step floor face
+            if safe_fixture_z > float('-inf') and floor_z < safe_fixture_z:
+                return safe_fixture_z + 0.2
+            return floor_z
+
+        # For full-height outer contours / perimeters:
+        # Check if there are opposing setups (Setup 1 Top, Setup 2 Bottom Flip)
+        if hasattr(self.context, "setups") and len(self.context.setups) > 1:
+            curr_idx = next((i for i, s in enumerate(self.context.setups) if s.id == self.setup.id), 0)
+            M_curr = self.setup.model_to_setup
+            try:
+                M_curr_inv = np.linalg.inv(M_curr)
+            except np.linalg.LinAlgError:
+                M_curr_inv = np.eye(4)
+            u_curr = (M_curr_inv @ np.array([0.0, 0.0, 1.0, 0.0]))[:3]
+
+            opposing_setups = []
+            for s_other in self.context.setups:
+                if s_other.id == self.setup.id:
+                    continue
+                M_other = s_other.model_to_setup
+                try:
+                    M_other_inv = np.linalg.inv(M_other)
+                except np.linalg.LinAlgError:
+                    M_other_inv = np.eye(4)
+                u_other = (M_other_inv @ np.array([0.0, 0.0, 1.0, 0.0]))[:3]
+                if float(np.dot(u_curr, u_other)) <= -0.85:
+                    opposing_setups.append(s_other)
+
+            if opposing_setups:
+                total_height = top_z - floor_z
+                if total_height > 1.0:
+                    parting_z = top_z - 0.55 * total_height
+                    if safe_fixture_z > float('-inf'):
+                        return max(parting_z, safe_fixture_z + 0.5)
+                    return parting_z
+
+        if safe_fixture_z > float('-inf') and floor_z < safe_fixture_z:
+            return safe_fixture_z + 0.5
+        return floor_z
+
     def _plan_roughing(self) -> list[PlannedOperation]:
         ops: list[PlannedOperation] = []
         for f in self.features:
             if f.type not in ROUGHABLE_TYPES:
+                continue
+            if self._is_machined_in_prior_setup(f):
                 continue
             req = self._req(f)
             if f.accessibility is Accessibility.INACCESSIBLE:
@@ -592,9 +731,11 @@ class OperationPlanner:
             if tool is None:
                 continue
             params = self.analyzer.analyze(tool, f, OpPurpose.ROUGHING.value, self.setup)
+            effective_final_z = self._get_effective_z_floor(f)
             notes: dict = {
                 "requirement": req.trace(OpPurpose.ROUGHING.value, reason),
                 "strategy": req.strategy,
+                "final_z": effective_final_z,
             }
             if req.strategy == "pocket":
                 # Deep enclosed cavity -> pocket (high-efficiency) clearing
@@ -695,6 +836,8 @@ class OperationPlanner:
                 continue
             if f.accessibility is Accessibility.INACCESSIBLE:
                 continue
+            if self._is_machined_in_prior_setup(f):
+                continue
             extent = f.xy_extent
             if f.type is FeatureType.CONTOUR and float(max(extent) if len(extent) else 0.0) < 1e-6:
                 continue
@@ -712,12 +855,14 @@ class OperationPlanner:
                 continue
             params = self.analyzer.analyze(tool, f, OpPurpose.FINISHING.value,
                                            self.setup)
+            effective_final_z = self._get_effective_z_floor(f)
             ops.append(PlannedOperation(
                 id=self._next_id("op_finish"), purpose=OpPurpose.FINISHING,
                 feature=f, tool=tool, params=params,
                 notes={
                     "requirement": req.trace(OpPurpose.FINISHING.value, reason),
                     "strategy": req.strategy,
+                    "final_z": effective_final_z,
                 }))
         return ops
 
@@ -747,6 +892,8 @@ class OperationPlanner:
             if f.type not in hole_types or f.diameter is None:
                 continue
             if f.accessibility is Accessibility.INACCESSIBLE:
+                continue
+            if self._is_machined_in_prior_setup(f):
                 continue
             # Stock condition: a hole is only spotted when material fills it.
             req = self._req(f)
@@ -784,6 +931,8 @@ class OperationPlanner:
             if f.type not in hole_types or f.diameter is None:
                 continue
             if f.accessibility is Accessibility.INACCESSIBLE:
+                continue
+            if self._is_machined_in_prior_setup(f):
                 continue
 
             # Stock condition: drilling exists only when material fills the bore.
@@ -885,6 +1034,8 @@ class OperationPlanner:
             if f.type not in BORE_TYPES or f.diameter is None:
                 continue
             if f.accessibility is Accessibility.INACCESSIBLE:
+                continue
+            if self._is_machined_in_prior_setup(f):
                 continue
             # Required surface: only a precision bore is bored; bulk material
             # is removed by drilling.
