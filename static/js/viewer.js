@@ -23,7 +23,7 @@ class Cam3DViewer {
     this.toolpathVisible = true;
     this.featureHighlightGroup = new THREE.Group();
     this.toolGroup = new THREE.Group();
-    this.toolVisible = true;
+    this.toolVisible = false;
     this.fixtureGroup = new THREE.Group();
     this.fixtureVisible = true;
     this.clampZoneGroup = new THREE.Group();
@@ -133,12 +133,52 @@ class Cam3DViewer {
 
   setupEnvironment() {
     // 3D Grid on XY Plane (Z=0)
-    const gridSize = 300;
-    const gridDivisions = 30;
-    this.grid = new THREE.GridHelper(gridSize, gridDivisions, 0x00f0ff, 0x1e293b);
+    const gridSize = 400;
+    const gridDivisions = 40;
+    this.grid = new THREE.GridHelper(gridSize, gridDivisions, 0x00f0ff, 0x1a243b);
     this.grid.rotateX(Math.PI / 2); // Rotate to lie on XY plane (Z-up)
     this.grid.position.set(50, 30, 0);
     this.scene.add(this.grid);
+
+    // Build Coordinate Origin Datum Triad
+    this.buildWcsOriginMarker('G54');
+  }
+
+  buildWcsOriginMarker(workOffset = 'G54') {
+    if (this.wcsMarker) {
+      this.scene.remove(this.wcsMarker);
+      this.wcsMarker = null;
+    }
+    const group = new THREE.Group();
+    group.name = 'wcs_triad';
+    const axisLen = 25;
+    const headLen = 6;
+    const headWidth = 2.5;
+
+    // X Axis (Red)
+    const arrowX = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 0, 0), axisLen, 0xef4444, headLen, headWidth);
+    arrowX.renderOrder = 999;
+    group.add(arrowX);
+
+    // Y Axis (Green)
+    const arrowY = new THREE.ArrowHelper(new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0, 0), axisLen, 0x10b981, headLen, headWidth);
+    arrowY.renderOrder = 999;
+    group.add(arrowY);
+
+    // Z Axis (Cyan/Blue)
+    const arrowZ = new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 0, 0), axisLen, 0x00f0ff, headLen, headWidth);
+    arrowZ.renderOrder = 999;
+    group.add(arrowZ);
+
+    // Origin Center Sphere
+    const sphere = new THREE.Mesh(
+      new THREE.SphereGeometry(1.6, 16, 16),
+      new THREE.MeshBasicMaterial({ color: 0xffffff })
+    );
+    group.add(sphere);
+
+    this.wcsMarker = group;
+    this.scene.add(this.wcsMarker);
   }
 
   buildSimTool(diameter = 10, fluteLength = 35) {
@@ -1096,26 +1136,53 @@ class Cam3DViewer {
   }
 
   highlightFeature(feature) {
+    if (!this.featureHighlightGroup) return;
     this.featureHighlightGroup.clear();
     if (!feature) return;
 
-    const min = feature.bounds_min;
-    const max = feature.bounds_max;
-    const sx = Math.max(max[0] - min[0], 2);
-    const sy = Math.max(max[1] - min[1], 2);
-    const sz = Math.max(max[2] - min[2], 2);
+    let min = feature.bounds_min || (feature.bounding_box && feature.bounding_box.min) || (feature.bounds && feature.bounds.min);
+    let max = feature.bounds_max || (feature.bounding_box && feature.bounding_box.max) || (feature.bounds && feature.bounds.max);
+
+    if (!min || !max) {
+      if (feature.center) {
+        const r = (feature.diameter || 10) / 2;
+        const d = feature.depth || 10;
+        min = [feature.center[0] - r, feature.center[1] - r, feature.center[2] - d];
+        max = [feature.center[0] + r, feature.center[1] + r, feature.center[2] + d];
+      } else {
+        return;
+      }
+    }
+
+    const sx = Math.max(max[0] - min[0], 1.5);
+    const sy = Math.max(max[1] - min[1], 1.5);
+    const sz = Math.max(max[2] - min[2], 1.5);
 
     const boxGeom = new THREE.BoxGeometry(sx, sy, sz);
     const boxMat = new THREE.MeshBasicMaterial({
       color: 0x00f0ff,
-      wireframe: true,
       transparent: true,
-      opacity: 0.8,
+      opacity: 0.25,
+      side: THREE.DoubleSide,
+      depthWrite: false,
     });
+    const boxMesh = new THREE.Mesh(boxGeom, boxMat);
+    boxMesh.position.set(min[0] + sx / 2, min[1] + sy / 2, min[2] + sz / 2);
 
-    const highlightBox = new THREE.Mesh(boxGeom, boxMat);
-    highlightBox.position.set(min[0] + sx / 2, min[1] + sy / 2, min[2] + sz / 2);
-    this.featureHighlightGroup.add(highlightBox);
+    const edgeGeom = new THREE.EdgesGeometry(boxGeom);
+    const edgeLine = new THREE.LineSegments(
+      edgeGeom,
+      new THREE.LineBasicMaterial({ color: 0x00f0ff, linewidth: 2, transparent: true, opacity: 0.9 })
+    );
+    boxMesh.add(edgeLine);
+
+    this.featureHighlightGroup.add(boxMesh);
+  }
+
+  clearFeatureHighlight() {
+    if (this.featureHighlightGroup) {
+      this.featureHighlightGroup.clear();
+    }
   }
 
   setSimulationProgress(fraction) {
@@ -1177,11 +1244,16 @@ class Cam3DViewer {
           }
         }
 
+        const tInfo = seg.tool_id ? this.toolCatalog[seg.tool_id] : null;
+        const toolDisplay = tInfo ? `${tInfo.id}: ${tInfo.name} (Ø${tInfo.diameter}mm)` : (seg.tool_id || '--');
+
         const info = {
           pos: { x: pos.x, y: pos.y, z: pos.z },
           spindle: seg.spindle || 0,
           feed: seg.feed || 0,
-          tool: seg.tool_id || '--',
+          tool: toolDisplay,
+          tool_id: seg.tool_id || '--',
+          tool_info: tInfo,
           setup_id: seg.setup_id || '--',
           setup_name: sObj?.name || (seg.setup_id === 'setup_002' ? 'Setup 2 (G55)' : 'Setup 1 (G54)'),
           work_offset: sObj?.work_offset || (seg.setup_id === 'setup_002' ? 'G55' : 'G54'),
@@ -1204,20 +1276,78 @@ class Cam3DViewer {
     }
   }
 
-  setCameraView(viewType) {
+  setCameraView(viewType, smooth = true) {
     const target = this.controls.target;
     const dist = 180;
+    const newPos = new THREE.Vector3();
+
     if (viewType === 'iso') {
-      this.camera.position.set(target.x + 120, target.y - 120, target.z + 100);
+      newPos.set(target.x + 120, target.y - 120, target.z + 100);
     } else if (viewType === 'top') {
-      this.camera.position.set(target.x, target.y, target.z + dist);
+      newPos.set(target.x, target.y, target.z + dist);
     } else if (viewType === 'front') {
-      this.camera.position.set(target.x, target.y - dist, target.z);
+      newPos.set(target.x, target.y - dist, target.z);
+    } else if (viewType === 'right') {
+      newPos.set(target.x + dist, target.y, target.z);
+    } else if (viewType === 'left') {
+      newPos.set(target.x - dist, target.y, target.z);
+    } else if (viewType === 'back') {
+      newPos.set(target.x, target.y + dist, target.z);
+    } else if (viewType === 'bottom') {
+      newPos.set(target.x, target.y, target.z - dist);
     } else if (viewType === 'reset') {
-      this.camera.position.set(target.x + 100, target.y - 150, target.z + 120);
+      newPos.set(target.x + 100, target.y - 150, target.z + 120);
+    } else {
+      newPos.set(target.x + 120, target.y - 120, target.z + 100);
     }
-    this.camera.lookAt(target);
-    this.controls.update();
+
+    if (smooth) {
+      this.animateCameraTo(newPos, target, 350);
+    } else {
+      this.camera.position.copy(newPos);
+      this.camera.lookAt(target);
+      this.controls.update();
+    }
+  }
+
+  animateCameraTo(targetPos, targetLookAt, durationMs = 350) {
+    const startPos = this.camera.position.clone();
+    const startTarget = this.controls.target.clone();
+    const startTime = performance.now();
+
+    const step = (now) => {
+      const elapsed = now - startTime;
+      const progress = Math.min(1, elapsed / durationMs);
+      const ease = 1 - Math.pow(1 - progress, 3);
+
+      this.camera.position.lerpVectors(startPos, targetPos, ease);
+      this.controls.target.lerpVectors(startTarget, targetLookAt, ease);
+      this.controls.update();
+
+      if (progress < 1) {
+        requestAnimationFrame(step);
+      }
+    };
+    requestAnimationFrame(step);
+  }
+
+  setStockOpacity(val) {
+    const opacity = Math.max(0.05, Math.min(1.0, (parseFloat(val) || 60) / 100));
+    if (this.stockMesh && this.stockMesh.material) {
+      this.stockMesh.material.opacity = opacity;
+      this.stockMesh.material.needsUpdate = true;
+    }
+  }
+
+  updateViewCube() {
+    const cubeEl = document.getElementById('viewcube');
+    if (!cubeEl || !this.camera || !this.controls) return;
+
+    const v = new THREE.Vector3().subVectors(this.camera.position, this.controls.target).normalize();
+    const yawDeg = THREE.MathUtils.radToDeg(Math.atan2(v.x, -v.y));
+    const pitchDeg = THREE.MathUtils.radToDeg(Math.asin(Math.max(-1, Math.min(1, v.z))));
+
+    cubeEl.style.transform = `rotateX(${-pitchDeg}deg) rotateY(${-yawDeg}deg)`;
   }
 
   togglePart(visible) {
@@ -1281,6 +1411,7 @@ class Cam3DViewer {
     }
 
     this.controls.update();
+    this.updateViewCube();
     this.renderer.render(this.scene, this.camera);
   }
 }

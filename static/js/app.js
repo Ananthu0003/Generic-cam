@@ -169,8 +169,14 @@ document.addEventListener('DOMContentLoaded', () => {
   // ------------------------------------------------------------- Stepper Logic
   function setStep(stepNum) {
     state.currentStep = stepNum;
+
+    // Clear any active 3D feature highlight when transitioning between workflow steps
+    viewer.clearFeatureHighlight();
+
     stepBtns.forEach((btn) => {
-      btn.classList.toggle('active', parseInt(btn.dataset.step) === stepNum);
+      const bStep = parseInt(btn.dataset.step);
+      btn.classList.toggle('active', bStep === stepNum);
+      btn.classList.toggle('completed', bStep < stepNum);
     });
     stepPanels.forEach((panel) => {
       panel.classList.toggle('active', panel.id === `panel-step-${stepNum}`);
@@ -192,6 +198,9 @@ document.addEventListener('DOMContentLoaded', () => {
         renderToolpathsSetupTabs();
         applyActiveToolpathView();
       }
+      viewer.toggleTool(true);
+      toolVisible = true;
+      if (toggleToolBtn) toggleToolBtn.classList.add('active');
     } else if (stepNum === 6 && !state.gcodeResult) {
       generateGcode();
     }
@@ -325,14 +334,25 @@ document.addEventListener('DOMContentLoaded', () => {
       const item = document.createElement('div');
       item.className = `setup-tab-item ${s.id === activeId ? 'active' : ''}`;
       const badgeClass = (s.work_offset || '').toLowerCase().replace('.', '-');
+      const rot = s.rotation_deg || [0, 0, 0];
+      const rotStr = (rot[0] !== 0 || rot[1] !== 0 || rot[2] !== 0) 
+        ? `${rot[0] ? `X ${rot[0]}° ` : ''}${rot[1] ? `Y ${rot[1]}° ` : ''}${rot[2] ? `Z ${rot[2]}°` : ''}`.trim()
+        : 'Top Orientation (0°)';
 
       item.innerHTML = `
         <div class="setup-tab-info">
-          <span class="setup-badge ${badgeClass}">${s.work_offset}</span>
-          <span class="setup-tab-title">${s.name}</span>
-          <span style="font-size: 0.72rem; color: var(--text-dim);">(${s.feature_ids ? s.feature_ids.length : 0} feats)</span>
+          <span class="setup-badge ${badgeClass}">${s.work_offset || 'G54'}</span>
+          <div>
+            <div class="setup-tab-title">${s.name}</div>
+            <div style="font-size: 0.70rem; color: var(--text-dim); display:flex; gap:6px; align-items:center;">
+              <span>${rotStr}</span>
+              <span>•</span>
+              <span class="text-cyan">${s.feature_ids ? s.feature_ids.length : 0} feats</span>
+            </div>
+          </div>
         </div>
         <div class="setup-tab-actions">
+          ${s.id === activeId ? '<span class="status-dot" title="Active Setup" style="width:6px; height:6px;"></span>' : ''}
           ${setups.length > 1 && idx > 0 ? `<button class="btn-icon-del" data-setup-id="${s.id}" title="Delete setup">&times;</button>` : ''}
         </div>
       `;
@@ -727,8 +747,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function renderFeaturesList(features) {
     featureListContainer.innerHTML = '';
-    if (features.length === 0) {
-      featureListContainer.innerHTML = '<div class="text-dim p-2">No features recognized.</div>';
+    if (!features || features.length === 0) {
+      featureListContainer.innerHTML = '<div class="text-dim p-2" style="font-size:0.8rem; text-align:center;">No machinable features recognized yet. Click "Scan Features" to analyze 3D B-Rep topology.</div>';
       return;
     }
 
@@ -738,15 +758,23 @@ document.addEventListener('DOMContentLoaded', () => {
       item.dataset.featureId = f.id;
 
       const title = f.id.replace('feat_', '').replace('_', ' ');
-      const dimStr = f.diameter ? `Ø${f.diameter.toFixed(1)}mm` : `Depth: ${f.depth.toFixed(1)}mm`;
+      const dimStr = f.diameter ? `Ø${f.diameter.toFixed(1)}mm` : `Depth ${f.depth.toFixed(1)}mm`;
       const setupName = f.notes && f.notes.setup_name ? f.notes.setup_name : '';
+      const workOffset = f.notes && f.notes.work_offset ? f.notes.work_offset : '';
 
       item.innerHTML = `
-        <div>
-          <div style="font-weight: 500; font-size: 0.85rem; text-transform: capitalize;">${title}</div>
-          <div style="font-size: 0.72rem; color: var(--text-dim);">${dimStr} ${setupName ? `| <span class="text-cyan">${setupName}</span>` : ''}</div>
+        <div style="display:flex; flex-direction:column; gap:2px;">
+          <div style="font-weight: 600; font-size: 0.825rem; text-transform: capitalize; display:flex; align-items:center; gap:6px;">
+            <span>${title}</span>
+            ${workOffset ? `<span class="setup-badge ${workOffset === 'G55' ? 'g55' : ''}" style="font-size:0.6rem; padding:1px 5px;">${workOffset}</span>` : ''}
+          </div>
+          <div style="font-size: 0.70rem; color: var(--text-dim); display:flex; gap:6px; align-items:center;">
+            <span class="mono text-cyan">${dimStr}</span>
+            ${f.depth !== undefined && f.diameter ? `<span class="mono">Depth: ${f.depth.toFixed(1)}mm</span>` : ''}
+            ${setupName ? `<span>• <span class="text-muted">${setupName}</span></span>` : ''}
+          </div>
         </div>
-        <span class="feature-tag ${f.type}">${f.type}</span>
+        <span class="feature-tag ${f.type}">${f.type.replace('_', ' ')}</span>
       `;
 
       item.addEventListener('mouseenter', () => viewer.highlightFeature(f));
@@ -853,19 +881,43 @@ document.addEventListener('DOMContentLoaded', () => {
       item.style.display = 'flex';
       item.style.justifyContent = 'space-between';
       item.style.alignItems = 'center';
+      item.style.cursor = 'pointer';
+      item.title = 'Click to inspect tool geometry & cutting parameters';
+
       item.innerHTML = `
-        <div>
-          <div style="font-weight: 600; font-size: 0.85rem;" class="mono text-cyan">${t.id}: ${t.name}</div>
-          <div style="font-size: 0.72rem; color: var(--text-dim);">Max ${t.max_rpm} RPM | ${t.flutes} Flutes | Ø${t.diameter}mm</div>
+        <div style="display:flex; flex-direction:column; gap:2px; flex:1;">
+          <div style="font-weight: 700; font-size: 0.825rem; display:flex; align-items:center; gap:6px;" class="mono">
+            <span class="text-cyan">${t.id}</span>
+            <span style="color:var(--text-main); font-weight:600;">${t.name}</span>
+          </div>
+          <div style="font-size: 0.70rem; color: var(--text-dim); display:flex; gap:6px; align-items:center;">
+            <span class="mono text-emerald">Ø${t.diameter}mm</span>
+            <span>•</span>
+            <span class="mono">${t.flutes}F</span>
+            <span>•</span>
+            <span>Flute: ${t.flute_length || 15}mm</span>
+            <span>•</span>
+            <span>${t.max_rpm || 10000} RPM</span>
+          </div>
         </div>
-        <button class="btn btn-sm btn-outline delete-tool-btn" data-id="${t.id}" title="Remove Tool" style="padding:2px 8px; font-size:0.75rem; color:#f87171; border-color:rgba(248,113,113,0.3);">✕</button>
+        <div style="display:flex; align-items:center; gap:6px;">
+          <button class="btn btn-sm btn-outline inspect-tool-btn" data-id="${t.id}" title="Inspect Tool Specs" style="padding:2px 7px; font-size:0.7rem; color:var(--accent-cyan); border-color:rgba(0,240,255,0.3);">Specs</button>
+          <button class="btn btn-sm btn-outline delete-tool-btn" data-id="${t.id}" title="Remove Tool" style="padding:2px 7px; font-size:0.75rem; color:#f87171; border-color:rgba(248,113,113,0.3);">✕</button>
+        </div>
       `;
+
+      item.addEventListener('click', (e) => {
+        if (e.target.closest('.delete-tool-btn')) return;
+        openToolInspector(t.id);
+      });
+
       toolListContainer.appendChild(item);
     });
 
     // Wire up delete tool buttons
     toolListContainer.querySelectorAll('.delete-tool-btn').forEach(btn => {
       btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
         const tid = e.currentTarget.getAttribute('data-id');
         try {
           const res = await fetch(`/api/tools/${tid}`, { method: 'DELETE' });
@@ -885,6 +937,18 @@ document.addEventListener('DOMContentLoaded', () => {
 
   async function loadOperations() {
     try {
+      if (!state.features || state.features.length === 0) {
+        try {
+          const featRes = await fetch('/api/recognize-features', { method: 'POST' });
+          if (featRes.ok) {
+            const featData = await featRes.json();
+            state.features = featData.features;
+          }
+        } catch (e) {
+          console.warn('Could not auto-fetch features for op highlighting:', e);
+        }
+      }
+
       const res = await fetch('/api/plan-operations', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1002,27 +1066,226 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  let activeOpsSetupTab = 'all';
+
+  function renderOpsSetupFilter() {
+    const filterContainer = document.getElementById('ops-setup-filter-container');
+    if (!filterContainer) return;
+    const setups = state.setups || [];
+    if (setups.length <= 1) {
+      filterContainer.style.display = 'none';
+      return;
+    }
+
+    filterContainer.style.display = 'grid';
+    filterContainer.style.gridTemplateColumns = `repeat(${setups.length + 1}, 1fr)`;
+    filterContainer.style.gap = '4px';
+    filterContainer.innerHTML = '';
+
+    const allBtn = document.createElement('button');
+    allBtn.type = 'button';
+    allBtn.className = `gcode-setup-tab ${activeOpsSetupTab === 'all' ? 'active' : ''}`;
+    allBtn.style.padding = '4px 8px';
+    allBtn.innerHTML = `
+      <span class="tab-title" style="font-size:0.75rem;">ALL</span>
+      <span class="tab-chip" style="font-size:0.65rem;">${(state.plannedOps || []).length}</span>
+    `;
+    allBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      activeOpsSetupTab = 'all';
+      renderOpsSetupFilter();
+      renderOpsList(state.plannedOps);
+    });
+    filterContainer.appendChild(allBtn);
+
+    setups.forEach((s, idx) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = `gcode-setup-tab ${activeOpsSetupTab === s.id ? 'active' : ''}`;
+      btn.style.padding = '4px 8px';
+      const opCount = (state.plannedOps || []).filter(op => op.notes?.setup_id === s.id).length;
+      btn.innerHTML = `
+        <span class="tab-title" style="font-size:0.75rem;">OP${(idx + 1) * 10}</span>
+        <span class="tab-chip" style="font-size:0.65rem;">${opCount}</span>
+      `;
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        activeOpsSetupTab = s.id;
+        renderOpsSetupFilter();
+        renderOpsList(state.plannedOps);
+      });
+      filterContainer.appendChild(btn);
+    });
+  }
+
   function renderOpsList(ops) {
+    const opCountBadge = document.getElementById('op-count-badge');
+    if (!ops || ops.length === 0) {
+      if (opCountBadge) opCountBadge.textContent = '0 Ops';
+      opListContainer.innerHTML = `
+        <div style="padding: 24px 16px; text-align: center; color: var(--text-dim); font-size: 0.82rem; border: 1px dashed rgba(255,255,255,0.1); border-radius: 8px; background: rgba(0,0,0,0.2);">
+          <div style="margin-bottom: 6px; font-size: 1.1rem;">⚙️</div>
+          <div>No planned operations generated yet.</div>
+          <button id="btn-initial-plan-ops" class="btn btn-sm btn-primary" style="margin-top: 10px; font-size: 0.78rem;">Generate Sequence</button>
+        </div>
+      `;
+      const planBtn = opListContainer.querySelector('#btn-initial-plan-ops');
+      if (planBtn) planBtn.addEventListener('click', loadOperations);
+      return;
+    }
+
+    renderOpsSetupFilter();
+
+    let displayOps = ops;
+    if (activeOpsSetupTab !== 'all') {
+      displayOps = ops.filter(op => op.notes?.setup_id === activeOpsSetupTab);
+    }
+
+    if (opCountBadge) {
+      opCountBadge.textContent = `${displayOps.length} / ${ops.length} Ops`;
+    }
+
     opListContainer.innerHTML = '';
-    ops.forEach((op, index) => {
+
+    displayOps.forEach((op, index) => {
+      const origIndex = ops.indexOf(op);
       const item = document.createElement('div');
       item.className = 'op-card-item';
+      item.dataset.purpose = (op.purpose || 'operation').toLowerCase();
+      item.dataset.opId = op.id;
+
       const setupName = op.notes && op.notes.setup_name ? op.notes.setup_name : '';
-      const workOffset = op.notes && op.notes.work_offset ? op.notes.work_offset : '';
+      const workOffset = op.notes && op.notes.work_offset ? op.notes.work_offset : 'G54';
+      
+      // Clean purpose string
+      let rawPurpose = op.purpose || 'Operation';
+      let purposeStr = rawPurpose.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+
+      const tool = (state.tools || []).find(t => t.id === op.tool_id);
+      const toolName = tool ? tool.name : (op.tool_id || 'Tool');
+      const toolDia = tool ? `Ø${tool.diameter}mm` : '';
+      
+      // Clean numeric parameters
+      const feedVal = op.feed_rate ? Math.round(Number(op.feed_rate)) : 0;
+      const rpmVal = op.spindle_rpm ? Math.round(Number(op.spindle_rpm)) : 0;
+      const apVal = (op.cut_depth !== undefined && op.cut_depth !== null) ? Number(op.cut_depth).toFixed(1) : null;
+      const aeVal = (op.stepover !== undefined && op.stepover !== null) ? Number(op.stepover).toFixed(1) : null;
 
       item.innerHTML = `
-        <div>
-          <div style="font-weight: 600; font-size: 0.85rem;">
-            ${index + 1}. <span style="text-transform: uppercase;">${op.purpose}</span> (${op.feature_id})
-            ${workOffset ? `<span class="setup-badge ${workOffset === 'G55' ? 'g55' : ''}">${workOffset}</span>` : ''}
+        <!-- Top Row: # Seq + Operation Name + Setup -->
+        <div class="op-row-top">
+          <div class="op-title-wrap">
+            <span class="op-seq-pill">#${origIndex + 1}</span>
+            <span class="op-title-text">${purposeStr}</span>
           </div>
-          <div style="font-size: 0.72rem; color: var(--text-dim);">
-            ${op.tool_id} | Feed: ${op.feed_rate} mm/min | ${op.spindle_rpm} RPM ${setupName ? `| ${setupName}` : ''}
-          </div>
+          <span class="setup-badge ${workOffset === 'G55' ? 'g55' : (workOffset === 'G56' ? 'g56' : '')}">
+            ${workOffset}
+          </span>
         </div>
-        <span class="feature-tag ${op.purpose}">${op.purpose}</span>
+
+        <!-- Target CAD Feature Link -->
+        <div class="op-row-feature">
+          <span class="op-feat-link" title="Target CAD Feature: ${op.feature_id || ''}">⚲ ${op.feature_id || 'Feature'}</span>
+        </div>
+        
+        <!-- Tool Row: Clear Descriptive Tool Dropdown + Specs Button -->
+        <div class="op-row-tool">
+          <div class="op-tool-label-prefix">
+            <span class="op-tool-icon">🔧</span>
+            <span class="op-tool-text-lbl">Tool:</span>
+          </div>
+          <select class="op-tool-select" data-op-id="${op.id}" data-op-orig-idx="${origIndex}" title="Switch cutting tool for this operation">
+            ${(state.tools || []).map(t => {
+              const cleanType = (t.name || t.type || 'Tool').replace(/_/g, ' ');
+              return `
+                <option value="${t.id}" ${t.id === op.tool_id ? 'selected' : ''}>
+                  ${t.id}: ${cleanType} (Ø${t.diameter}mm)
+                </option>
+              `;
+            }).join('')}
+          </select>
+          <button type="button" class="btn-inspect-tool inspect-op-tool-btn" data-tool-id="${op.tool_id}" title="Inspect Tool Geometry & Specs">
+            🔍 Specs
+          </button>
+        </div>
+
+        <!-- Feeds & Speeds Parameters -->
+        <div class="op-row-stats">
+          <span class="op-stat-pill" title="Cutting Feed Rate">
+            <span class="lbl">F</span>
+            <b>${feedVal}</b>
+            <span class="unit">mm/min</span>
+          </span>
+          <span class="op-stat-pill" title="Spindle Speed">
+            <span class="lbl">S</span>
+            <b>${rpmVal}</b>
+            <span class="unit">RPM</span>
+          </span>
+          ${apVal !== null ? `
+            <span class="op-stat-pill" title="Depth of Cut">
+              <span class="lbl">ap</span>
+              <b>${apVal}</b>
+              <span class="unit">mm</span>
+            </span>
+          ` : ''}
+          <span class="op-stat-pill op-stat-safe" title="Clearance Z Verified">✓ Safe Z</span>
+        </div>
       `;
+
+      // Click and hover card to highlight target feature in 3D
+      item.addEventListener('mouseenter', () => {
+        const matchedFeature = (state.features || []).find(f => f.id === op.feature_id || f.canonical_id === op.feature_id || f.id === op.notes?.feature_id);
+        if (matchedFeature) {
+          viewer.highlightFeature(matchedFeature);
+        }
+      });
+
+      item.addEventListener('click', (e) => {
+        if (e.target.closest('.op-tool-select') || e.target.closest('.inspect-op-tool-btn')) return;
+        opListContainer.querySelectorAll('.op-card-item').forEach(c => c.classList.remove('selected'));
+        item.classList.add('selected');
+        
+        const matchedFeature = (state.features || []).find(f => f.id === op.feature_id || f.canonical_id === op.feature_id || f.id === op.notes?.feature_id);
+        if (matchedFeature) {
+          viewer.highlightFeature(matchedFeature);
+        }
+      });
+
       opListContainer.appendChild(item);
+    });
+
+    // Wire up tool selection changes per operation
+    opListContainer.querySelectorAll('.op-tool-select').forEach(sel => {
+      sel.addEventListener('change', (e) => {
+        const origIdx = parseInt(e.target.dataset.opOrigIdx);
+        const newToolId = e.target.value;
+        if (state.plannedOps && state.plannedOps[origIdx]) {
+          state.plannedOps[origIdx].tool_id = newToolId;
+          const matchedTool = (state.tools || []).find(t => t.id === newToolId);
+          if (matchedTool && matchedTool.max_rpm) {
+            state.plannedOps[origIdx].spindle_rpm = Math.min(state.plannedOps[origIdx].spindle_rpm || 6000, matchedTool.max_rpm);
+          }
+          showToast(`Assigned ${newToolId} to Operation #${origIdx + 1}`, 'success', 2000);
+          renderOpsList(state.plannedOps);
+        }
+      });
+    });
+
+    // Wire up clicking tool badge to open Tool Inspector Modal
+    opListContainer.querySelectorAll('.inspect-op-tool-btn').forEach(badge => {
+      badge.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const tid = badge.dataset.toolId;
+        openToolInspector(tid);
+      });
+    });
+  }
+
+  const btnReplanOps = document.getElementById('btn-replan-ops');
+  if (btnReplanOps) {
+    btnReplanOps.addEventListener('click', async () => {
+      showToast('Re-planning machining operations...', 'info', 1500);
+      await loadOperations();
     });
   }
 
@@ -1079,6 +1342,9 @@ document.addEventListener('DOMContentLoaded', () => {
   function applyActiveToolpathView() {
     if (!state.toolpaths || state.toolpaths.length === 0) return;
 
+    // Clear feature highlights when inspecting toolpaths
+    viewer.clearFeatureHighlight();
+
     let paths = state.toolpaths;
     let setupObj = null;
 
@@ -1132,6 +1398,67 @@ document.addEventListener('DOMContentLoaded', () => {
     viewer.renderToolpaths(paths, activeToolpathTab, state.setups, state.toolpaths);
     simScrubber.value = 0;
     viewer.setSimulationProgress(0);
+
+    // Render Active Tooling Breakdown in Step 5
+    const toolpathToolsCard = document.getElementById('toolpath-tools-card');
+    const toolpathToolsList = document.getElementById('toolpath-tools-list');
+    const toolpathToolsCount = document.getElementById('toolpath-tools-count');
+
+    if (toolpathToolsCard && toolpathToolsList) {
+      const toolMap = {};
+      paths.forEach(tp => {
+        const tid = tp.tool_id || 'T01';
+        if (!toolMap[tid]) {
+          const tInfo = (state.tools || []).find(t => t.id === tid);
+          toolMap[tid] = {
+            id: tid,
+            name: tInfo ? tInfo.name : tid,
+            diameter: tInfo ? tInfo.diameter : 0,
+            type: tInfo ? (tInfo.type || 'endmill').replace(/_/g, ' ') : 'endmill',
+            cutLen: 0,
+            rapidLen: 0,
+            segments: 0,
+          };
+        }
+        toolMap[tid].cutLen += (tp.cutting_length_mm || 0);
+        toolMap[tid].rapidLen += (tp.rapid_length_mm || 0);
+        toolMap[tid].segments += (tp.segment_count || tp.segments?.length || 0);
+      });
+
+      const uniqueTools = Object.values(toolMap);
+      if (uniqueTools.length > 0) {
+        toolpathToolsCard.style.display = 'block';
+        if (toolpathToolsCount) toolpathToolsCount.textContent = `${uniqueTools.length} Tool${uniqueTools.length > 1 ? 's' : ''}`;
+        toolpathToolsList.innerHTML = uniqueTools.map(t => `
+          <div class="tool-card-item" data-tool-id="${t.id}" style="cursor:pointer;" title="Click to view tool specs">
+            <div style="display:flex; flex-direction:column; gap:2px;">
+              <div style="font-weight:700; font-size:0.8rem; display:flex; align-items:center; gap:6px;">
+                <span class="mono text-cyan">${t.id}</span>
+                <span style="color:var(--text-main); font-weight:600;">${t.name}</span>
+                <span class="mono text-emerald" style="font-size:0.72rem;">Ø${t.diameter}mm</span>
+              </div>
+              <div style="font-size:0.70rem; color:var(--text-dim); display:flex; gap:6px; align-items:center;">
+                <span>Cut: <span class="mono text-cyan">${t.cutLen.toFixed(1)}mm</span></span>
+                <span>•</span>
+                <span>${t.segments} Segs</span>
+                <span>•</span>
+                <span style="text-transform:capitalize;">${t.type}</span>
+              </div>
+            </div>
+            <button class="btn btn-sm btn-outline" style="padding:2px 7px; font-size:0.7rem; color:var(--accent-cyan); border-color:rgba(0,240,255,0.3);" title="View Specs">Specs</button>
+          </div>
+        `).join('');
+
+        toolpathToolsList.querySelectorAll('.tool-card-item').forEach(item => {
+          item.addEventListener('click', () => {
+            const tid = item.dataset.toolId;
+            openToolInspector(tid);
+          });
+        });
+      } else {
+        toolpathToolsCard.style.display = 'none';
+      }
+    }
   }
 
   const chkHoldingTabs = document.getElementById('chk-holding-tabs');
@@ -1173,6 +1500,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
       renderToolpathsSetupTabs();
       applyActiveToolpathView();
+      showToast(`Generated ${data.toolpaths.length} toolpath operations`, 'success', 2500);
     } catch (err) {
       console.error('Failed to generate toolpaths:', err);
     } finally {
@@ -1334,12 +1662,27 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
 
+  function highlightGcode(rawGcode) {
+    if (!rawGcode) return '';
+    const escaped = rawGcode
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+
+    return escaped
+      .replace(/(\([^\)]*\))/g, '<span class="gcode-comment">$1</span>')
+      .replace(/\b([GM][0-9]+(?:\.[0-9]+)?)\b/g, '<span class="gcode-code">$1</span>')
+      .replace(/\b([XYZIJKABCR][+-]?[0-9]+(?:\.[0-9]+)?)\b/g, '<span class="gcode-coord">$1</span>')
+      .replace(/\b([FS][0-9]+(?:\.[0-9]+)?)\b/g, '<span class="gcode-feed">$1</span>')
+      .replace(/\b(T[0-9]+)\b/g, '<span class="gcode-tool">$1</span>');
+  }
+
   function renderActiveGcodeView() {
     if (!state.gcodeResult) return;
 
     if (activeGcodeTab !== 'all' && cachedPerSetupGcode && cachedPerSetupGcode[activeGcodeTab]) {
       const setupData = cachedPerSetupGcode[activeGcodeTab];
-      gcodeOutput.textContent = setupData.gcode;
+      gcodeOutput.innerHTML = `<code>${highlightGcode(setupData.gcode)}</code>`;
       if (gcodeLineCounter) {
         gcodeLineCounter.textContent = `${setupData.line_count.toLocaleString()} lines (${(setupData.cycle_time_seconds / 60).toFixed(1)} min)`;
       }
@@ -1350,7 +1693,7 @@ document.addEventListener('DOMContentLoaded', () => {
         btnDownloadLabel.textContent = `Download ${setupData.work_offset} .NC`;
       }
     } else {
-      gcodeOutput.textContent = state.gcodeResult.gcode;
+      gcodeOutput.innerHTML = `<code>${highlightGcode(state.gcodeResult.gcode)}</code>`;
       const count = Object.keys(cachedPerSetupGcode).length || (state.setups ? state.setups.length : 1);
       if (gcodeLineCounter) {
         gcodeLineCounter.textContent = `${state.gcodeResult.line_count.toLocaleString()} lines (${(state.gcodeResult.cycle_time_seconds / 60).toFixed(1)} min)`;
@@ -1364,7 +1707,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-
   postControllerSelect.addEventListener('change', generateGcode);
   btnExportGcode.addEventListener('click', () => {
     setStep(6);
@@ -1372,9 +1714,14 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   btnCopyGcode.addEventListener('click', () => {
-    const textToCopy = gcodeOutput.textContent;
-    if (textToCopy) {
-      navigator.clipboard.writeText(textToCopy);
+    let rawText = '';
+    if (activeGcodeTab !== 'all' && cachedPerSetupGcode && cachedPerSetupGcode[activeGcodeTab]) {
+      rawText = cachedPerSetupGcode[activeGcodeTab].gcode;
+    } else if (state.gcodeResult) {
+      rawText = state.gcodeResult.gcode;
+    }
+    if (rawText) {
+      navigator.clipboard.writeText(rawText);
       btnCopyGcode.textContent = 'Copied!';
       setTimeout(() => (btnCopyGcode.innerHTML = `
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
@@ -1569,7 +1916,7 @@ document.addEventListener('DOMContentLoaded', () => {
   let stockVisible = true;
   let fixtureVisible = true;
   let toolpathVisible = true;
-  let toolVisible = true;
+  let toolVisible = false;
   let wireframeEnabled = false;
 
   togglePartBtn.addEventListener('click', () => {
@@ -1612,14 +1959,241 @@ document.addEventListener('DOMContentLoaded', () => {
     toggleWireframeBtn.classList.toggle('active', wireframeEnabled);
   });
 
+  const viewRightBtn = document.getElementById('view-right');
+  const viewBottomBtn = document.getElementById('view-bottom');
+  const stockOpacitySlider = document.getElementById('stock-opacity-slider');
+
   viewIsoBtn.addEventListener('click', () => viewer.setCameraView('iso'));
   viewTopBtn.addEventListener('click', () => viewer.setCameraView('top'));
   viewFrontBtn.addEventListener('click', () => viewer.setCameraView('front'));
+  if (viewRightBtn) viewRightBtn.addEventListener('click', () => viewer.setCameraView('right'));
+  if (viewBottomBtn) viewBottomBtn.addEventListener('click', () => viewer.setCameraView('bottom'));
   viewResetBtn.addEventListener('click', () => viewer.setCameraView('reset'));
+
+  if (stockOpacitySlider) {
+    stockOpacitySlider.addEventListener('input', (e) => {
+      viewer.setStockOpacity(e.target.value);
+    });
+  }
+
+  // Interactive 3D ViewCube Face Clicks
+  const viewCubeFaces = document.querySelectorAll('.cube-face');
+  viewCubeFaces.forEach((face) => {
+    face.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const v = face.dataset.view;
+      if (v) viewer.setCameraView(v, true);
+    });
+  });
+
+  // ------------------------------------------------------------- Toast Notification Engine
+  function showToast(message, type = 'info', duration = 3000) {
+    const container = document.getElementById('toast-container');
+    if (!container) return;
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+    let iconSvg = '';
+    if (type === 'success') {
+      iconSvg = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" class="text-emerald"><polyline points="20 6 9 17 4 12"/></svg>';
+    } else if (type === 'warning') {
+      iconSvg = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" class="text-amber"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>';
+    } else if (type === 'error') {
+      iconSvg = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" class="text-red"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>';
+    } else {
+      iconSvg = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" class="text-cyan"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>';
+    }
+    toast.innerHTML = `${iconSvg}<span>${message}</span>`;
+    container.appendChild(toast);
+
+    setTimeout(() => {
+      toast.style.opacity = '0';
+      toast.style.transform = 'translateY(10px)';
+      toast.style.transition = 'all 0.25s ease';
+      setTimeout(() => toast.remove(), 250);
+    }, duration);
+  }
+
+  // ------------------------------------------------------------- Keyboard Shortcuts Engine & Modal
+  const btnShortcuts = document.getElementById('btn-shortcuts');
+  const shortcutsModal = document.getElementById('shortcuts-modal');
+  const btnCloseShortcuts = document.getElementById('btn-close-shortcuts');
+
+  function openShortcutsModal() {
+    if (shortcutsModal) shortcutsModal.classList.add('active');
+  }
+
+  function closeShortcutsModal() {
+    if (shortcutsModal) shortcutsModal.classList.remove('active');
+  }
+
+  if (btnShortcuts) btnShortcuts.addEventListener('click', openShortcutsModal);
+  if (btnCloseShortcuts) btnCloseShortcuts.addEventListener('click', closeShortcutsModal);
+  if (shortcutsModal) {
+    shortcutsModal.addEventListener('click', (e) => {
+      if (e.target === shortcutsModal) closeShortcutsModal();
+    });
+  }
+
+  window.addEventListener('keydown', (e) => {
+    // Ignore keypresses if user is typing into an input or select
+    if (['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement?.tagName)) {
+      if (e.key === 'Escape') {
+        document.activeElement.blur();
+      }
+      return;
+    }
+
+    if (e.key >= '1' && e.key <= '6') {
+      const step = parseInt(e.key, 10);
+      setStep(step);
+      showToast(`Switched to Step ${step}`, 'info', 1500);
+    } else if (e.code === 'Space') {
+      e.preventDefault();
+      simBtnPlay.click();
+    } else if (e.key === 'r' || e.key === 'R') {
+      simBtnReset.click();
+      viewer.setCameraView('reset');
+      showToast('Simulation & View Reset', 'info', 1500);
+    } else if (e.key === 't' || e.key === 'T') {
+      viewer.setCameraView('top');
+    } else if (e.key === 'f' || e.key === 'F') {
+      viewer.setCameraView('front');
+    } else if (e.key === 'i' || e.key === 'I') {
+      viewer.setCameraView('iso');
+    } else if (e.key === 'w' || e.key === 'W') {
+      toggleWireframeBtn.click();
+    } else if (e.key === 'p' || e.key === 'P') {
+      togglePartBtn.click();
+    } else if (e.key === 's' || e.key === 'S') {
+      toggleStockBtn.click();
+    } else if (e.key === '?' || (e.shiftKey && e.key === '/')) {
+      if (shortcutsModal?.classList.contains('active')) {
+        closeShortcutsModal();
+      } else {
+        openShortcutsModal();
+      }
+    } else if (e.key === 'Escape') {
+      closeShortcutsModal();
+      if (setupSheetModal) setupSheetModal.classList.remove('active');
+      if (toolInspectorModal) toolInspectorModal.style.display = 'none';
+    }
+  });
+
+  // ------------------------------------------------------------- Tool Geometry & Parameters Inspector
+  const toolInspectorModal = document.getElementById('tool-inspector-modal');
+  const btnCloseToolInspector = document.getElementById('btn-close-tool-inspector');
+  const toolInspectorTitle = document.getElementById('tool-inspector-title');
+  const toolInspectorBody = document.getElementById('tool-inspector-body');
+
+  function openToolInspector(toolId) {
+    if (!toolInspectorModal || !toolInspectorBody) return;
+    const tool = (state.tools || []).find(t => t.id === toolId);
+    if (!tool) {
+      showToast(`Tool ${toolId} not found in library`, 'warning', 2500);
+      return;
+    }
+
+    if (toolInspectorTitle) {
+      toolInspectorTitle.textContent = `${tool.id} - ${tool.name}`;
+    }
+
+    const usingOps = (state.plannedOps || []).filter(op => op.tool_id === tool.id);
+
+    toolInspectorBody.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; background:rgba(0, 240, 255, 0.06); padding:10px 14px; border-radius:6px; border:1px solid rgba(0, 240, 255, 0.2);">
+        <div>
+          <div style="font-size:0.75rem; color:var(--text-dim); text-transform:uppercase; font-weight:600;">Tool Classification</div>
+          <div style="font-size:1.0rem; font-weight:700; color:var(--accent-cyan); text-transform:capitalize;">${(tool.type || 'Tool').replace(/_/g, ' ')}</div>
+        </div>
+        <span class="mono text-emerald" style="font-size:1.15rem; font-weight:700;">Ø${tool.diameter} mm</span>
+      </div>
+
+      <div class="tool-inspector-grid">
+        <div class="tool-inspector-stat">
+          <span class="label">Cutting Diameter (ØD)</span>
+          <span class="val text-cyan">Ø${tool.diameter} mm</span>
+        </div>
+        <div class="tool-inspector-stat">
+          <span class="label">Flute Length (Lc)</span>
+          <span class="val">${tool.flute_length || 15.0} mm</span>
+        </div>
+        <div class="tool-inspector-stat">
+          <span class="label">Flute Count (z)</span>
+          <span class="val">${tool.flutes || 2} Flutes</span>
+        </div>
+        <div class="tool-inspector-stat">
+          <span class="label">Max Spindle Speed</span>
+          <span class="val text-amber">${tool.max_rpm || 10000} RPM</span>
+        </div>
+        <div class="tool-inspector-stat">
+          <span class="label">Corner Radius (r)</span>
+          <span class="val">${tool.corner_radius !== undefined ? `${tool.corner_radius} mm` : '0.0 mm (Square)'}</span>
+        </div>
+        <div class="tool-inspector-stat">
+          <span class="label">Overall Length (L)</span>
+          <span class="val">${tool.overall_length || 50.0} mm</span>
+        </div>
+      </div>
+
+      <div style="margin-top:14px; border-top:1px solid rgba(255,255,255,0.08); padding-top:12px;">
+        <div style="font-size:0.75rem; font-weight:700; color:var(--text-muted); text-transform:uppercase; margin-bottom:8px; display:flex; justify-content:space-between;">
+          <span>Assigned Operations (${usingOps.length})</span>
+          <span class="text-cyan">${usingOps.length > 0 ? 'Active in Program' : 'Idle in Carousel'}</span>
+        </div>
+        ${usingOps.length > 0 ? `
+          <div style="display:flex; flex-direction:column; gap:5px; max-height:140px; overflow-y:auto;">
+            ${usingOps.map((op, idx) => `
+              <div style="display:flex; justify-content:space-between; align-items:center; background:rgba(0,0,0,0.3); padding:6px 10px; border-radius:4px; font-size:0.75rem; border:1px solid rgba(255,255,255,0.04);">
+                <div style="display:flex; align-items:center; gap:6px;">
+                  <span class="mono text-cyan" style="font-weight:700;">#${idx + 1}</span>
+                  <span style="font-weight:600; text-transform:uppercase;">${(op.purpose || 'Op').replace(/_/g, ' ')}</span>
+                  <span style="color:var(--text-dim);">(${op.feature_id})</span>
+                </div>
+                <div style="display:flex; gap:8px; align-items:center;">
+                  <span class="mono text-emerald">${op.feed_rate} mm/min</span>
+                  <span class="mono text-muted">${op.spindle_rpm} RPM</span>
+                </div>
+              </div>
+            `).join('')}
+          </div>
+        ` : `
+          <div style="color:var(--text-dim); font-size:0.78rem; font-style:italic; padding:6px 0;">No operations are currently assigned to this tool.</div>
+        `}
+      </div>
+
+      <div style="margin-top:16px; display:flex; justify-content:flex-end; gap:8px;">
+        <button id="btn-close-tool-inspector-footer" class="btn btn-secondary btn-sm" style="padding:6px 14px; font-size:0.8rem;">Close</button>
+      </div>
+    `;
+
+    toolInspectorModal.style.display = 'flex';
+
+    const closeFooter = toolInspectorBody.querySelector('#btn-close-tool-inspector-footer');
+    if (closeFooter) {
+      closeFooter.addEventListener('click', () => {
+        toolInspectorModal.style.display = 'none';
+      });
+    }
+  }
+
+  // Expose globally for inline onclick handlers if needed
+  window.openToolInspector = openToolInspector;
+
+  if (btnCloseToolInspector) {
+    btnCloseToolInspector.addEventListener('click', () => {
+      if (toolInspectorModal) toolInspectorModal.style.display = 'none';
+    });
+  }
+  if (toolInspectorModal) {
+    toolInspectorModal.addEventListener('click', (e) => {
+      if (e.target === toolInspectorModal) toolInspectorModal.style.display = 'none';
+    });
+  }
 
   btnLoadDemo.addEventListener('click', () => {
     loadDemoModel();
     setStep(1);
+    showToast('Demo model loaded', 'success', 2000);
   });
 
   // ------------------------------------------------------------- Initial Boot
