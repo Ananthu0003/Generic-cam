@@ -401,6 +401,32 @@ def get_default_tools() -> list[Tool]:
             material="carbide",
             can_plunge=True,
         ),
+        # T19: micro drill — 1.5mm diameter (corner relief / small holes)
+        Tool(
+            id="T19",
+            tool_number=19,
+            type=ToolType.DRILL,
+            diameter=1.5,
+            corner_radius=0.0,
+            flute_length=12.0,
+            overall_length=40.0,
+            flutes=2,
+            material="carbide",
+            can_plunge=True,
+        ),
+        # T20: micro drill — 1.0mm diameter (corner relief / micro pilot holes)
+        Tool(
+            id="T20",
+            tool_number=20,
+            type=ToolType.DRILL,
+            diameter=1.0,
+            corner_radius=0.0,
+            flute_length=8.0,
+            overall_length=35.0,
+            flutes=2,
+            material="carbide",
+            can_plunge=True,
+        ),
     ]
 
 

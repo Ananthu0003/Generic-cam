@@ -47,9 +47,9 @@ class Cam3DViewer {
     this.toolCatalog = {};
     this.currentSimToolId = null;
 
-    // Dynamic stock heightfield grid (optimized 64x64 for fast real-time 60fps carving)
-    this.gridNX = 64;
-    this.gridNY = 64;
+    // Dynamic stock heightfield grid (high-resolution adaptive grid for sharp edge definition)
+    this.gridNX = 160;
+    this.gridNY = 160;
     this.stockHeights = null;
     this.initialStockHeights = null;
     this.stockGeom = null;
@@ -335,7 +335,11 @@ class Cam3DViewer {
     ));
     this.isCylinderStock = isCylinder;
 
-    // Dual-Surface Solid Stock Mesh for 3D In-Process Workpiece (IPW)
+    // High-resolution adaptive heightfield grid (~0.40mm cell pitch) for razor-sharp edge definition
+    const targetSpacing = 0.40;
+    this.gridNX = Math.max(128, Math.min(256, Math.round(sx / targetSpacing)));
+    this.gridNY = Math.max(128, Math.min(256, Math.round(sy / targetSpacing)));
+
     const NX = this.gridNX;
     const NY = this.gridNY;
     const numVerts = NX * NY;
@@ -384,6 +388,7 @@ class Cam3DViewer {
     // [+ 2*NY]: Right Wall (Top & Bot)
     const totalVertsCount = 2 * numVerts + 4 * NX + 4 * NY;
     const positions = new Float32Array(totalVertsCount * 3);
+    const normals = new Float32Array(totalVertsCount * 3);
     const indices = [];
 
     // 1. Top Face Vertices [0 .. numVerts-1]
@@ -523,18 +528,24 @@ class Cam3DViewer {
 
     const stockGeom = new THREE.BufferGeometry();
     stockGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    stockGeom.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
     stockGeom.setIndex(indices);
-    stockGeom.computeVertexNormals();
     this.stockGeom = stockGeom;
 
+    this.computeStockNormals();
+
+    // Polished CNC machinable stock material with crisp specular reflections & sharp silhouettes
     const stockMat = new THREE.MeshStandardMaterial({
       color: 0xf59e0b,
-      roughness: 0.35,
-      metalness: 0.25,
+      roughness: 0.28,
+      metalness: 0.35,
       transparent: true,
-      opacity: 0.60,
-      side: THREE.DoubleSide,
-      depthWrite: false,
+      opacity: 0.72,
+      side: THREE.FrontSide,
+      depthWrite: true,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
     });
 
     this.stockMesh = new THREE.Mesh(stockGeom, stockMat);
@@ -547,17 +558,17 @@ class Cam3DViewer {
     if (isCylinder) {
       const radius = Math.max(sx, sy) / 2;
       const height = sz;
-      const cylinderGeom = new THREE.CylinderGeometry(radius, radius, height, 48, 1, false);
+      const cylinderGeom = new THREE.CylinderGeometry(radius, radius, height, 64, 1, false);
       const axis = (stockConfig.cylinder_axis || 'Z').toUpperCase();
       if (axis === 'Z') {
         cylinderGeom.rotateX(Math.PI / 2);
       } else if (axis === 'X') {
         cylinderGeom.rotateZ(Math.PI / 2);
       }
-      const edges = new THREE.EdgesGeometry(cylinderGeom, 30);
+      const edges = new THREE.EdgesGeometry(cylinderGeom, 25);
       const cylWire = new THREE.LineSegments(
         edges,
-        new THREE.LineBasicMaterial({ color: 0xf59e0b, transparent: true, opacity: 0.6 })
+        new THREE.LineBasicMaterial({ color: 0xf59e0b, transparent: true, opacity: 0.75, linewidth: 1.5 })
       );
       cylWire.position.set(min[0] + sx / 2, min[1] + sy / 2, min[2] + sz / 2);
       this.stockMesh.add(cylWire);
@@ -566,7 +577,7 @@ class Cam3DViewer {
       const edges = new THREE.EdgesGeometry(boxGeom);
       const boxWire = new THREE.LineSegments(
         edges,
-        new THREE.LineBasicMaterial({ color: 0xf59e0b, transparent: true, opacity: 0.4 })
+        new THREE.LineBasicMaterial({ color: 0xf59e0b, transparent: true, opacity: 0.65, linewidth: 1.5 })
       );
       boxWire.position.set(min[0] + sx / 2, min[1] + sy / 2, min[2] + sz / 2);
       this.stockMesh.add(boxWire);
@@ -575,6 +586,186 @@ class Cam3DViewer {
     // Add stockMesh directly to partGroup so it flips/rotates synchronously with the part!
     this.partGroup.add(this.stockMesh);
     this.updateFixtures(stockBounds, stockConfig);
+  }
+
+  computeStockNormals() {
+    if (!this.stockGeom || !this.currentTopHeights || !this.currentBotHeights || !this.rawStockBounds) return;
+    const normAttr = this.stockGeom.attributes.normal;
+    if (!normAttr) return;
+    const normals = normAttr.array;
+    const NX = this.gridNX;
+    const NY = this.gridNY;
+    const numVerts = NX * NY;
+    const min = this.rawStockBounds.min;
+    const max = this.rawStockBounds.max;
+    const sx = Math.max(max[0] - min[0], 1);
+    const sy = Math.max(max[1] - min[1], 1);
+    const dx = sx / (NX - 1);
+    const dy = sy / (NY - 1);
+    const topH = this.currentTopHeights;
+    const botH = this.currentBotHeights;
+    const cliffThreshold = 0.18; // Step drop threshold for sharp edge normals
+
+    // 1. Top Face Normals with step-discontinuity preservation
+    for (let j = 0; j < NY; j++) {
+      const jRow = j * NX;
+      for (let i = 0; i < NX; i++) {
+        const k = jRow + i;
+        const z = topH[k];
+
+        // Horizontal X derivative
+        let dzdx = 0;
+        const hasL = i > 0;
+        const hasR = i < NX - 1;
+        const zL = hasL ? topH[k - 1] : z;
+        const zR = hasR ? topH[k + 1] : z;
+        const diffL = z - zL;
+        const diffR = zR - z;
+
+        if (hasL && hasR) {
+          const dropL = Math.abs(diffL) > cliffThreshold;
+          const dropR = Math.abs(diffR) > cliffThreshold;
+          if (dropL && !dropR) {
+            dzdx = diffR / dx;
+          } else if (!dropL && dropR) {
+            dzdx = diffL / dx;
+          } else if (dropL && dropR) {
+            dzdx = 0;
+          } else {
+            dzdx = (zR - zL) / (2 * dx);
+          }
+        } else if (hasR) {
+          dzdx = Math.abs(diffR) > cliffThreshold ? 0 : diffR / dx;
+        } else if (hasL) {
+          dzdx = Math.abs(diffL) > cliffThreshold ? 0 : diffL / dx;
+        }
+
+        // Vertical Y derivative
+        let dzdy = 0;
+        const hasD = j > 0;
+        const hasU = j < NY - 1;
+        const zD = hasD ? topH[k - NX] : z;
+        const zU = hasU ? topH[k + NX] : z;
+        const diffD = z - zD;
+        const diffU = zU - z;
+
+        if (hasD && hasU) {
+          const dropD = Math.abs(diffD) > cliffThreshold;
+          const dropU = Math.abs(diffU) > cliffThreshold;
+          if (dropD && !dropU) {
+            dzdy = diffU / dy;
+          } else if (!dropD && dropU) {
+            dzdy = diffD / dy;
+          } else if (dropD && dropU) {
+            dzdy = 0;
+          } else {
+            dzdy = (zU - zD) / (2 * dy);
+          }
+        } else if (hasU) {
+          dzdy = Math.abs(diffU) > cliffThreshold ? 0 : diffU / dy;
+        } else if (hasD) {
+          dzdy = Math.abs(diffD) > cliffThreshold ? 0 : diffD / dy;
+        }
+
+        // Normalized normal: (-dz/dx, -dz/dy, 1)
+        const nx = -dzdx;
+        const ny = -dzdy;
+        const nz = 1.0;
+        const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1.0;
+        normals[k * 3] = nx / len;
+        normals[k * 3 + 1] = ny / len;
+        normals[k * 3 + 2] = nz / len;
+      }
+    }
+
+    // 2. Bottom Face Normals
+    for (let j = 0; j < NY; j++) {
+      const jRow = j * NX;
+      for (let i = 0; i < NX; i++) {
+        const k = jRow + i;
+        const outIdx = (numVerts + k) * 3;
+        const z = botH[k];
+
+        let dzdx = 0;
+        const hasL = i > 0;
+        const hasR = i < NX - 1;
+        const zL = hasL ? botH[k - 1] : z;
+        const zR = hasR ? botH[k + 1] : z;
+        const diffL = z - zL;
+        const diffR = zR - z;
+
+        if (hasL && hasR) {
+          const dropL = Math.abs(diffL) > cliffThreshold;
+          const dropR = Math.abs(diffR) > cliffThreshold;
+          if (dropL && !dropR) dzdx = diffR / dx;
+          else if (!dropL && dropR) dzdx = diffL / dx;
+          else if (dropL && dropR) dzdx = 0;
+          else dzdx = (zR - zL) / (2 * dx);
+        } else if (hasR) dzdx = Math.abs(diffR) > cliffThreshold ? 0 : diffR / dx;
+        else if (hasL) dzdx = Math.abs(diffL) > cliffThreshold ? 0 : diffL / dx;
+
+        let dzdy = 0;
+        const hasD = j > 0;
+        const hasU = j < NY - 1;
+        const zD = hasD ? botH[k - NX] : z;
+        const zU = hasU ? botH[k + NX] : z;
+        const diffD = z - zD;
+        const diffU = zU - z;
+
+        if (hasD && hasU) {
+          const dropD = Math.abs(diffD) > cliffThreshold;
+          const dropU = Math.abs(diffU) > cliffThreshold;
+          if (dropD && !dropU) dzdy = diffU / dy;
+          else if (!dropD && dropU) dzdy = diffD / dy;
+          else if (dropD && dropU) dzdy = 0;
+          else dzdy = (zU - zD) / (2 * dy);
+        } else if (hasU) dzdy = Math.abs(diffU) > cliffThreshold ? 0 : diffU / dy;
+        else if (hasD) dzdy = Math.abs(diffD) > cliffThreshold ? 0 : diffD / dy;
+
+        const nx = dzdx;
+        const ny = dzdy;
+        const nz = -1.0;
+        const len = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1.0;
+        normals[outIdx] = nx / len;
+        normals[outIdx + 1] = ny / len;
+        normals[outIdx + 2] = nz / len;
+      }
+    }
+
+    // 3. Side Walls Normals: Pure perpendicular outward vectors
+    let off = numVerts * 2;
+    // Front wall: normal = (0, -1, 0)
+    for (let i = 0; i < 2 * NX; i++) {
+      normals[(off + i) * 3] = 0;
+      normals[(off + i) * 3 + 1] = -1;
+      normals[(off + i) * 3 + 2] = 0;
+    }
+    off += NX * 2;
+
+    // Back wall: normal = (0, 1, 0)
+    for (let i = 0; i < 2 * NX; i++) {
+      normals[(off + i) * 3] = 0;
+      normals[(off + i) * 3 + 1] = 1;
+      normals[(off + i) * 3 + 2] = 0;
+    }
+    off += NX * 2;
+
+    // Left wall: normal = (-1, 0, 0)
+    for (let j = 0; j < 2 * NY; j++) {
+      normals[(off + j) * 3] = -1;
+      normals[(off + j) * 3 + 1] = 0;
+      normals[(off + j) * 3 + 2] = 0;
+    }
+    off += NY * 2;
+
+    // Right wall: normal = (1, 0, 0)
+    for (let j = 0; j < 2 * NY; j++) {
+      normals[(off + j) * 3] = 1;
+      normals[(off + j) * 3 + 1] = 0;
+      normals[(off + j) * 3 + 2] = 0;
+    }
+
+    normAttr.needsUpdate = true;
   }
 
   updateStockMeshGeometry() {
@@ -626,7 +817,7 @@ class Cam3DViewer {
     }
 
     posAttr.needsUpdate = true;
-    this.stockGeom.computeVertexNormals();
+    this.computeStockNormals();
     this.stockGeom.computeBoundingBox();
     this.stockGeom.computeBoundingSphere();
   }
@@ -1332,9 +1523,10 @@ class Cam3DViewer {
   }
 
   setStockOpacity(val) {
-    const opacity = Math.max(0.05, Math.min(1.0, (parseFloat(val) || 60) / 100));
+    const opacity = Math.max(0.05, Math.min(1.0, (parseFloat(val) || 72) / 100));
     if (this.stockMesh && this.stockMesh.material) {
       this.stockMesh.material.opacity = opacity;
+      this.stockMesh.material.depthWrite = (opacity >= 0.25);
       this.stockMesh.material.needsUpdate = true;
     }
   }

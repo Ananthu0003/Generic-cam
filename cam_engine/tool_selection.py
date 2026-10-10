@@ -124,6 +124,8 @@ class GeometryDrivenToolSelector:
             permissible_types = [ToolType.TAP]
         elif purpose_lower == "thread_milling":
             permissible_types = [ToolType.THREAD_MILL]
+        elif purpose_lower in ("corner_drilling", "pre_drilling"):
+            permissible_types = [ToolType.DRILL, ToolType.FLAT_ENDMILL, ToolType.SPOT_DRILL]
         elif purpose_lower in ("countersinking", "chamfering"):
             permissible_types = [ToolType.COUNTERSINK_TOOL, ToolType.CHAMFER_MILL]
         elif purpose_lower == "grooving":
@@ -189,7 +191,8 @@ class GeometryDrivenToolSelector:
                     dists = [np.min(np.linalg.norm(outer_arr[:, :2] - pt[:2], axis=1)) for pt in isl_arr]
                     if dists:
                         gap = float(np.min(dists))
-                        if min_wall_clearance is None or gap < min_wall_clearance:
+                        # Ignore step-shelf artifacts / concentric openings (< 0.5mm)
+                        if gap >= 0.5 and (min_wall_clearance is None or gap < min_wall_clearance):
                             min_wall_clearance = gap
 
         # 6. Corner / Fillet Radius
@@ -198,6 +201,8 @@ class GeometryDrivenToolSelector:
             corner_r = float(feature.fillet_radius)
         elif feature.radius is not None and ftype in (FeatureType.FILLET, FeatureType.POCKET, FeatureType.OPEN_POCKET, FeatureType.SLOT, FeatureType.OPEN_SLOT):
             corner_r = float(feature.radius)
+        elif feature.notes.get("min_corner_radius") is not None:
+            corner_r = float(feature.notes["min_corner_radius"])
         elif feature.notes.get("corner_radius") is not None:
             corner_r = float(feature.notes["corner_radius"])
         elif feature.boundary_loop and len(feature.boundary_loop) >= 8 and purpose_lower in ("finishing", "semi_finishing"):
@@ -213,7 +218,7 @@ class GeometryDrivenToolSelector:
 
         requires_corner_fit = bool(
             corner_r is not None
-            and purpose_lower in ("finishing", "semi_finishing", "rest_machining")
+            and purpose_lower in ("finishing", "semi_finishing", "rest_machining", "corner_drilling", "pre_drilling")
             and purpose_lower not in ("spot_drilling", "countersinking", "chamfering")
         )
         max_corner_radius = corner_r if requires_corner_fit else None
@@ -223,7 +228,12 @@ class GeometryDrivenToolSelector:
         # Base ceiling: default to large capacity unless constrained by geometry
         max_allowed_dia = 100.0
 
-        if ftype in (FeatureType.HOLE, FeatureType.BLIND_HOLE, FeatureType.THROUGH_HOLE, FeatureType.TAPPED_HOLE, FeatureType.THREADED_HOLE):
+        if purpose_lower in ("corner_drilling", "pre_drilling"):
+            # Corner drilling tool must fit the smallest corner radius (diameter <= 2 * R_min)
+            min_c_r = float(feature.notes.get("min_corner_radius") or corner_r or 1.0)
+            max_allowed_dia = 2.0 * min_c_r + 0.05
+
+        elif ftype in (FeatureType.HOLE, FeatureType.BLIND_HOLE, FeatureType.THROUGH_HOLE, FeatureType.TAPPED_HOLE, FeatureType.THREADED_HOLE):
             if purpose_lower in ("drilling", "tapping", "reaming"):
                 max_allowed_dia = feat_dia or 100.0
             elif purpose_lower in ("spot_drilling", "countersinking"):
@@ -254,7 +264,7 @@ class GeometryDrivenToolSelector:
                 max_allowed_dia = 2.0 * corner_r
 
         # Apply internal corner radius restriction for finishing operations
-        if requires_corner_fit and corner_r is not None:
+        if requires_corner_fit and corner_r is not None and purpose_lower not in ("roughing",):
             max_allowed_dia = min(max_allowed_dia, 2.0 * corner_r)
 
         # Apply island / wall gap restriction

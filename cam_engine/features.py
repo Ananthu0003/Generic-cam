@@ -999,7 +999,13 @@ class FeatureRecognizer:
                         if boundary_loop is None:
                             boundary_loop = loop_2d
                     else:
-                        # Inner wire = island (boss/obstacle inside the pocket)
+                        # Inner wire is only an island if separated from the outer boundary by >= 0.5mm
+                        if boundary_loop is not None:
+                            b_arr = np.array(boundary_loop)
+                            l_arr = np.array(loop_2d)
+                            dists = [np.min(np.linalg.norm(b_arr[:, :2] - pt[:2], axis=1)) for pt in l_arr]
+                            if dists and np.min(dists) < 0.5:
+                                continue  # Shelf step or concentric edge artifact
                         island_loops.append(loop_2d)
 
             # Check open vs closed boundary
@@ -1023,6 +1029,46 @@ class FeatureRecognizer:
             pocket_center = np.array([0.5 * (bmin2[0] + bmax2[0]), 0.5 * (bmin2[1] + bmax2[1]), floor_z])
             floor_norm = self.faces[floor_group[0]].oriented_normal if self.faces[floor_group[0]].oriented_normal is not None else self.tool_axis.copy()
 
+            # Extract internal corner fillets / cylindrical corners with radii
+            corner_details: list[dict] = []
+            for w in wall_faces_list:
+                wf = self.faces[w]
+                if wf.surface.kind is SurfaceKind.CYLINDER:
+                    axis = wf.surface.axis
+                    if axis is not None:
+                        axis_norm = axis / max(float(np.linalg.norm(axis)), 1e-12)
+                        if abs(float(axis_norm @ self.tool_axis)) > 0.85:
+                            r = float(wf.surface.radius)
+                            if len(wf.triangles):
+                                pts = wf.triangles.reshape(-1, 3)
+                                c_approx = pts.mean(axis=0)
+                                z_top_c = float(pts[:, 2].max())
+                                z_floor_c = float(pts[:, 2].min())
+                                is_dup = False
+                                for ec in corner_details:
+                                    if np.linalg.norm(np.array(ec["center"]) - c_approx[:2]) < 0.5 and abs(ec["radius"] - r) < 0.1:
+                                        is_dup = True
+                                        break
+                                if not is_dup:
+                                    corner_details.append({
+                                        "face_idx": w,
+                                        "radius": r,
+                                        "center": [float(c_approx[0]), float(c_approx[1])],
+                                        "x": float(c_approx[0]),
+                                        "y": float(c_approx[1]),
+                                        "z_top": z_top_c,
+                                        "z_floor": z_floor_c,
+                                    })
+
+            notes: dict = {}
+            if corner_details:
+                min_c_r = min(c["radius"] for c in corner_details)
+                notes["corner_details"] = corner_details
+                notes["min_corner_radius"] = min_c_r
+                notes["corner_radii"] = [c["radius"] for c in corner_details]
+                notes["requires_corner_drilling"] = True
+                notes["corner_radius"] = min_c_r
+
             out.append(MachiningFeature(
                 id=f"{ftype.value}_{floor_group[0]}",
                 type=ftype,
@@ -1042,12 +1088,14 @@ class FeatureRecognizer:
                 source_edges=self._edges_for_faces(all_feature_faces),
                 finish=self.requirements.get(floor_group[0]),
                 tolerances=self._tolerance_for_faces(all_feature_faces),
+                notes=notes,
                 recognition_evidence=[
                     f"type_{ftype.value}",
                     f"depth_{depth:.2f}",
                     f"floor_area_{sum(self.faces[i].area for i in floor_group):.1f}",
                     "open_boundary" if is_open else "closed_cavity",
                     f"islands_{len(island_loops)}" if island_loops else "no_islands",
+                    f"corners_{len(corner_details)}" if corner_details else "no_corners",
                 ],
                 surface_type="plane",
                 center=pocket_center,
@@ -1920,14 +1968,20 @@ class FeatureRecognizer:
                     return Accessibility.INACCESSIBLE
             return Accessibility.TOOL_AXIS_OK
 
+        total_pts = 0
+        hit_pts = 0
         for fi in face_ids:
             f = self.faces[fi]
             pts = f.triangles.reshape(-1, 3)
             step = max(1, len(pts) // 12)
             for p in pts[::step]:
+                total_pts += 1
                 hit = mesh.ray_first_hit(p + self.tool_axis * 1e-3, self.tool_axis, max_dist=1e4)
                 if hit is not None and hit > 1e-4:
-                    return Accessibility.INACCESSIBLE
+                    hit_pts += 1
+
+        if total_pts > 0 and (hit_pts / total_pts) >= 0.6:
+            return Accessibility.INACCESSIBLE
 
         return Accessibility.TOOL_AXIS_OK
 

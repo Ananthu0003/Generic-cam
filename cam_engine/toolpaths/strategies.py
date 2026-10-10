@@ -2697,140 +2697,149 @@ class StrategyEngine:
             if peck_reduction > 0:
                 current_peck_inc = max(min_peck, current_peck_inc - peck_reduction)
 
-        # 1. Approach above hole to clearance plane
-        self._rapid_to(tp, op, self._v3(center[0], center[1], clearance_plane))
-
-        # 2. Rapid to R-plane
-        r_pos = self._v3(center[0], center[1], retract_plane)
-        tp.add(MotionSegment(
-            motion_type=MotionType.RAPID,
-            start=self._v3(center[0], center[1], clearance_plane),
-            end=r_pos,
-            tool_id=tool.id, operation_id=op.id, feature_id=f.id
-        ))
-
-        cycle_type = str(op.notes.get("cycle_type", "G83"))
-        mat_name = getattr(self.s.context.material, "name", "") if hasattr(self.s, "context") and getattr(self.s, "context", None) and hasattr(self.s.context, "material") and self.s.context.material else ""
-
-        # Determine retract mode (G98 vs G99) based on operation safety and obstacle environment
-        explicit_retract = op.notes.get("retract_mode")
-        if explicit_retract in ("G98", "G99"):
-            retract_mode = explicit_retract
-            retract_reason = "Operation Note Override"
+        # Target drilling points (single hole or multi-point corner relief drilling)
+        raw_points = op.notes.get("drill_points")
+        if raw_points and len(raw_points) > 0:
+            target_points = [np.asarray(p[:2], dtype=float) for p in raw_points]
         else:
-            has_high_fixture = False
-            if hasattr(self.s.setup, "fixtures") and self.s.setup.fixtures:
-                for fix in self.s.setup.fixtures:
-                    if fix.bounds_max is not None and fix.bounds_max[2] > retract_plane:
-                        has_high_fixture = True
-                        break
+            target_points = [center]
 
-            is_multi_hole = bool(op.notes.get("is_multi_hole", False) or op.notes.get("hole_count", 1) > 1 or op.notes.get("is_pattern", False))
-            if has_high_fixture:
-                retract_mode = "G98"
-                retract_reason = "Fixture Clearance Above R-Plane"
-            elif is_multi_hole and op.notes.get("planar_pattern", True):
-                retract_mode = "G99"
-                retract_reason = "Planar Pattern Efficient Rapid"
-            else:
-                retract_mode = "G98"
-                retract_reason = "Single Hole Clearance"
+        for pt_idx, pt_center in enumerate(target_points):
+            # 1. Approach above hole to clearance plane
+            self._rapid_to(tp, op, self._v3(pt_center[0], pt_center[1], clearance_plane))
 
-        # 3. Generate structured peck sequence
-        canned_cycle_meta = {
-            "canned_cycle": {
-                "type": cycle_type,
-                "cycle": cycle_type,
-                "retract_mode": retract_mode,
-                "retract_reason": retract_reason,
-                "x": float(center[0]),
-                "y": float(center[1]),
-                "position": center.tolist(),
-                "start_plane": float(start_plane),
-                "retract_plane": float(retract_plane),
-                "z_r": float(retract_plane),
-                "z_depth": float(final_depth),
-                "final_depth": float(final_depth),
-                "tip_travel": float(tip_travel),
-                "cylindrical_depth": float(cylindrical_depth),
-                "required_cylindrical_depth": float(cylindrical_depth),
-                "peck": float(first_peck),
-                "first_peck": float(first_peck),
-                "subsequent_peck": float(subsequent_peck),
-                "peck_reduction": float(peck_reduction),
-                "min_peck": float(min_peck),
-                "feed": float(params.plunge_feed),
-                "spindle": float(params.spindle_rpm),
-                "initial_z": float(clearance_plane),
-                "depth_reference": depth_ref,
-                "depth_type": depth_sem.depth_type.value,
-                "depth_ref_datum": depth_sem.depth_reference.value,
-                "target_depth": depth_sem.target_depth,
-                "reference_z": depth_sem.reference_z,
-                "programmed_tip_depth": depth_sem.programmed_tip_depth,
-                "tip_length": float(tip_length),
-                "point_angle_deg": float(point_angle),
-                "tip_geometry": tip_geometry,
-                "floor_z": float(req_floor_z),
-                "remaining_web": float(op.notes.get("remaining_web", f.notes.get("remaining_web", 0.0))),
-                "breakthrough": float(breakthrough),
-                "ld_ratio": float(op.notes.get("ld_ratio", round(cylindrical_depth / max(tool.diameter, 0.01), 2))),
-                "peck_ratio": float(op.notes.get("peck_ratio", round(first_peck / max(tool.diameter, 0.01), 2))),
-                "material_name": mat_name,
-                "derivation_reason": depth_sem.derivation_reason,
-                "depth_semantics": depth_sem.to_dict(),
-            }
-        }
-        tp.metadata["canned_cycle_intent"] = canned_cycle_meta["canned_cycle"]
-        tp.metadata["depth_semantics"] = depth_sem.to_dict()
-
-        # Generate clean, independent peck motions
-        current_depth = start_plane
-        for peck_idx, target_z in enumerate(peck_depths):
-            meta = canned_cycle_meta if peck_idx == 0 else {}
-
-            # Chip clearance retract (for all pecks after the first)
-            if peck_idx > 0:
-                tp.add(MotionSegment(
-                    motion_type=MotionType.RETRACT,
-                    start=self._v3(center[0], center[1], current_depth),
-                    end=r_pos,
-                    tool_id=tool.id, operation_id=op.id, feature_id=f.id
-                ))
-
-            # Rapid approach to standoff clearance above current_depth
-            approach_plane = min(retract_plane, current_depth + approach_clearance)
-            if abs(r_pos[2] - approach_plane) > 1e-6:
-                tp.add(MotionSegment(
-                    motion_type=MotionType.RAPID,
-                    start=r_pos,
-                    end=self._v3(center[0], center[1], approach_plane),
-                    tool_id=tool.id, operation_id=op.id, feature_id=f.id
-                ))
-
-            # Controlled plunge feed from approach_plane to target_z
+            # 2. Rapid to R-plane
+            r_pos = self._v3(pt_center[0], pt_center[1], retract_plane)
             tp.add(MotionSegment(
-                motion_type=MotionType.PLUNGE,
-                start=self._v3(center[0], center[1], approach_plane),
-                end=self._v3(center[0], center[1], target_z),
-                feed=params.plunge_feed,
-                spindle=params.spindle_rpm,
-                tool_id=tool.id, operation_id=op.id, feature_id=f.id,
-                metadata=meta
+                motion_type=MotionType.RAPID,
+                start=self._v3(pt_center[0], pt_center[1], clearance_plane),
+                end=r_pos,
+                tool_id=tool.id, operation_id=op.id, feature_id=f.id
             ))
 
-            current_depth = target_z
+            cycle_type = str(op.notes.get("cycle_type", "G83"))
+            mat_name = getattr(self.s.context.material, "name", "") if hasattr(self.s, "context") and getattr(self.s, "context", None) and hasattr(self.s.context, "material") and self.s.context.material else ""
 
-        # 4. Final Retract to clearance plane
-        tp.add(MotionSegment(
-            motion_type=MotionType.RETRACT,
-            start=self._v3(center[0], center[1], current_depth),
-            end=self._v3(center[0], center[1], clearance_plane),
-            tool_id=tool.id, operation_id=op.id, feature_id=f.id
-        ))
+            # Determine retract mode (G98 vs G99) based on operation safety and obstacle environment
+            explicit_retract = op.notes.get("retract_mode")
+            if explicit_retract in ("G98", "G99"):
+                retract_mode = explicit_retract
+                retract_reason = "Operation Note Override"
+            else:
+                has_high_fixture = False
+                if hasattr(self.s.setup, "fixtures") and self.s.setup.fixtures:
+                    for fix in self.s.setup.fixtures:
+                        if fix.bounds_max is not None and fix.bounds_max[2] > retract_plane:
+                            has_high_fixture = True
+                            break
+
+                is_multi_hole = bool(op.notes.get("is_multi_hole", False) or op.notes.get("hole_count", 1) > 1 or op.notes.get("is_pattern", False) or len(target_points) > 1)
+                if has_high_fixture:
+                    retract_mode = "G98"
+                    retract_reason = "Fixture Clearance Above R-Plane"
+                elif is_multi_hole and op.notes.get("planar_pattern", True):
+                    retract_mode = "G99"
+                    retract_reason = "Planar Pattern Efficient Rapid"
+                else:
+                    retract_mode = "G98"
+                    retract_reason = "Single Hole Clearance"
+
+            # 3. Generate structured peck sequence
+            canned_cycle_meta = {
+                "canned_cycle": {
+                    "type": cycle_type,
+                    "cycle": cycle_type,
+                    "retract_mode": retract_mode,
+                    "retract_reason": retract_reason,
+                    "x": float(pt_center[0]),
+                    "y": float(pt_center[1]),
+                    "position": pt_center.tolist(),
+                    "start_plane": float(start_plane),
+                    "retract_plane": float(retract_plane),
+                    "z_r": float(retract_plane),
+                    "z_depth": float(final_depth),
+                    "final_depth": float(final_depth),
+                    "tip_travel": float(tip_travel),
+                    "cylindrical_depth": float(cylindrical_depth),
+                    "required_cylindrical_depth": float(cylindrical_depth),
+                    "peck": float(first_peck),
+                    "first_peck": float(first_peck),
+                    "subsequent_peck": float(subsequent_peck),
+                    "peck_reduction": float(peck_reduction),
+                    "min_peck": float(min_peck),
+                    "feed": float(params.plunge_feed),
+                    "spindle": float(params.spindle_rpm),
+                    "initial_z": float(clearance_plane),
+                    "depth_reference": depth_ref,
+                    "depth_type": depth_sem.depth_type.value,
+                    "depth_ref_datum": depth_sem.depth_reference.value,
+                    "target_depth": depth_sem.target_depth,
+                    "reference_z": depth_sem.reference_z,
+                    "programmed_tip_depth": depth_sem.programmed_tip_depth,
+                    "tip_length": float(tip_length),
+                    "point_angle_deg": float(point_angle),
+                    "tip_geometry": tip_geometry,
+                    "floor_z": float(req_floor_z),
+                    "remaining_web": float(op.notes.get("remaining_web", f.notes.get("remaining_web", 0.0))),
+                    "breakthrough": float(breakthrough),
+                    "ld_ratio": float(op.notes.get("ld_ratio", round(cylindrical_depth / max(tool.diameter, 0.01), 2))),
+                    "peck_ratio": float(op.notes.get("peck_ratio", round(first_peck / max(tool.diameter, 0.01), 2))),
+                    "material_name": mat_name,
+                    "derivation_reason": depth_sem.derivation_reason,
+                    "depth_semantics": depth_sem.to_dict(),
+                }
+            }
+            if pt_idx == 0:
+                tp.metadata["canned_cycle_intent"] = canned_cycle_meta["canned_cycle"]
+                tp.metadata["depth_semantics"] = depth_sem.to_dict()
+
+            # Generate clean, independent peck motions
+            current_depth = start_plane
+            for peck_idx, target_z in enumerate(peck_depths):
+                meta = canned_cycle_meta if (peck_idx == 0 and pt_idx == 0) else {}
+
+                # Chip clearance retract (for all pecks after the first)
+                if peck_idx > 0:
+                    tp.add(MotionSegment(
+                        motion_type=MotionType.RETRACT,
+                        start=self._v3(pt_center[0], pt_center[1], current_depth),
+                        end=r_pos,
+                        tool_id=tool.id, operation_id=op.id, feature_id=f.id
+                    ))
+
+                # Rapid approach to standoff clearance above current_depth
+                approach_plane = min(retract_plane, current_depth + approach_clearance)
+                if abs(r_pos[2] - approach_plane) > 1e-6:
+                    tp.add(MotionSegment(
+                        motion_type=MotionType.RAPID,
+                        start=r_pos,
+                        end=self._v3(pt_center[0], pt_center[1], approach_plane),
+                        tool_id=tool.id, operation_id=op.id, feature_id=f.id
+                    ))
+
+                # Controlled plunge feed from approach_plane to target_z
+                tp.add(MotionSegment(
+                    motion_type=MotionType.PLUNGE,
+                    start=self._v3(pt_center[0], pt_center[1], approach_plane),
+                    end=self._v3(pt_center[0], pt_center[1], target_z),
+                    feed=params.plunge_feed,
+                    spindle=params.spindle_rpm,
+                    tool_id=tool.id, operation_id=op.id, feature_id=f.id,
+                    metadata=meta
+                ))
+
+                current_depth = target_z
+
+            # 4. Final Retract to clearance plane
+            tp.add(MotionSegment(
+                motion_type=MotionType.RETRACT,
+                start=self._v3(pt_center[0], pt_center[1], current_depth),
+                end=self._v3(pt_center[0], pt_center[1], clearance_plane),
+                tool_id=tool.id, operation_id=op.id, feature_id=f.id
+            ))
 
         self._end_op(tp, op)
-        tp.metadata["strategy"] = "peck_drill"
+        tp.metadata["strategy"] = "corner_drilling" if op.notes.get("corner_drilling") else "peck_drill"
         return tp
 
     def _helical_interpolation(self, op: PlannedOperation) -> Toolpath:

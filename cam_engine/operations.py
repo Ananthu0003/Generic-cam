@@ -183,7 +183,9 @@ class OperationPlanner:
         ops: list[PlannedOperation] = []
         ops += self._plan_facing()
         ops += self._plan_spot_drilling()
-        ops += self._plan_roughing()
+        corner_drill_ops = self._plan_corner_drilling()
+        ops += corner_drill_ops
+        ops += self._plan_roughing(corner_drill_ops)
         ops += self._plan_rest_machining(ops)
         ops += self._plan_semi_finishing(ops)
         ops += self._plan_finishing(ops)
@@ -707,7 +709,80 @@ class OperationPlanner:
             return safe_fixture_z + 0.5
         return floor_z
 
-    def _plan_roughing(self) -> list[PlannedOperation]:
+    def _plan_corner_drilling(self) -> list[PlannedOperation]:
+        """Plans corner relief / pre-drilling for cavities with internal corners.
+        When corners have varying corner radii, selects a drilling tool sized by the
+        smallest corner radius among the corners (drill diameter <= 2 * R_min) to cleanly
+        drill all corner locations before cavity roughing and contour smoothing."""
+        ops: list[PlannedOperation] = []
+        for f in self.features:
+            if not f.is_concave or f.type not in (FeatureType.POCKET, FeatureType.OPEN_POCKET, FeatureType.SLOT, FeatureType.OPEN_SLOT):
+                continue
+            if self._is_machined_in_prior_setup(f):
+                continue
+            corners = f.notes.get("corner_details")
+            if not corners:
+                continue
+
+            # Smallest corner radius among all corners of this cavity
+            min_corner_r = float(f.notes.get("min_corner_radius", min(c["radius"] for c in corners)))
+
+            # Select tool sized by smallest corner radius
+            tool = self._pick_corner_drill_tool(f, min_corner_r)
+            if tool is None:
+                continue
+
+            params = self.analyzer.analyze(tool, f, OpPurpose.DRILLING.value, self.setup)
+            points = [[float(c["x"]), float(c["y"])] for c in corners]
+
+            op = PlannedOperation(
+                id=self._next_id("op_corner_drill"),
+                purpose=OpPurpose.DRILLING,
+                feature=f,
+                tool=tool,
+                params=params,
+                notes={
+                    "corner_drilling": True,
+                    "strategy": "corner_drilling",
+                    "drill_points": points,
+                    "min_corner_radius": min_corner_r,
+                    "corner_count": len(points),
+                    "start_z": float(f.top_z),
+                    "final_z": float(f.floor_z),
+                    "depth": float(f.depth),
+                    "method": "corner_peck_drill",
+                }
+            )
+            ops.append(op)
+        return ops
+
+    def _pick_corner_drill_tool(self, f: MachiningFeature, min_corner_r: float) -> Optional[Tool]:
+        res = self.tool_selector.select_optimal_tool(f, "corner_drilling", self.context.tools)
+        if res.success and res.selected_tool is not None:
+            return res.selected_tool
+
+        # Fallback: find any drill or endmill with diameter <= 2 * min_corner_r + 0.05
+        max_dia = 2.0 * min_corner_r + 0.05
+        candidate_tools = [
+            t for t in self.context.tools
+            if getattr(t, "can_plunge", True) and t.type in (ToolType.DRILL, ToolType.FLAT_ENDMILL, ToolType.SPOT_DRILL)
+            and t.diameter <= max_dia
+        ]
+        if candidate_tools:
+            # Pick the largest tool that fits within the smallest corner
+            candidate_tools.sort(key=lambda t: t.diameter, reverse=True)
+            return candidate_tools[0]
+
+        self.warnings.append({
+            "code": "MISSING_CORNER_DRILL",
+            "feature_id": f.id,
+            "feature_type": f.type.value if hasattr(f.type, "value") else str(f.type),
+            "message": f"No tool found for corner relief drilling (min corner R={min_corner_r:.2f}mm, max drill dia={max_dia:.2f}mm)",
+            "suggested_tool": {"type": "drill", "diameter": round(2.0 * min_corner_r, 2)},
+        })
+        return None
+
+    def _plan_roughing(self, prior_ops: Optional[list[PlannedOperation]] = None) -> list[PlannedOperation]:
         ops: list[PlannedOperation] = []
         for f in self.features:
             if f.type not in ROUGHABLE_TYPES:
@@ -740,9 +815,17 @@ class OperationPlanner:
             if req.strategy == "pocket":
                 # Deep enclosed cavity -> pocket (high-efficiency) clearing
                 notes["method"] = "adaptive"
+
+            # Depend on corner drilling if planned for this feature
+            depends = []
+            if prior_ops:
+                for po in prior_ops:
+                    if po.feature.id == f.id and po.notes.get("corner_drilling"):
+                        depends.append(po.id)
+
             ops.append(PlannedOperation(
                 id=self._next_id("op_rough"), purpose=OpPurpose.ROUGHING,
-                feature=f, tool=tool, params=params, notes=notes))
+                feature=f, tool=tool, params=params, notes=notes, depends_on=depends))
         return ops
 
     def _pick_roughing_tool(self, f: MachiningFeature) -> Optional[Tool]:

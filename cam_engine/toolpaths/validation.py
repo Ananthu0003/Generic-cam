@@ -1962,14 +1962,14 @@ class PreToolpathGeometryValidator:
                 ))
 
         # 4. Minimum Wall / Island Clearance
-        if feature.boundary_loop is not None and feature.island_loops:
+        if feature.boundary_loop is not None and feature.island_loops and not is_spot_or_chamfer and purpose_val not in ("corner_drilling", "pre_drilling"):
             outer_arr = np.asarray(feature.boundary_loop, dtype=float)
             for isl_idx, isl in enumerate(feature.island_loops):
                 isl_arr = np.asarray(isl, dtype=float)
                 if len(outer_arr) > 0 and len(isl_arr) > 0:
                     dists = [np.min(np.linalg.norm(outer_arr[:, :2] - pt[:2], axis=1)) for pt in isl_arr]
                     min_wall_clearance = float(np.min(dists)) if dists else None
-                    if min_wall_clearance is not None and min_wall_clearance > 1e-4:
+                    if min_wall_clearance is not None and min_wall_clearance >= 0.5:
                         if tool_dia > min_wall_clearance + 1e-4:
                             req_radius = min_wall_clearance / 2.0
                             errors.append(CamError(
